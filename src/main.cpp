@@ -328,7 +328,7 @@ std::filesystem::path BuildDownloadDir()
 {
     const char* userProfile = std::getenv("USERPROFILE");
     if (userProfile && *userProfile) {
-        return std::filesystem::path(userProfile) / "Downloads" / "apitool-downloads";
+        return std::filesystem::path(userProfile) / "Downloads" / "squirrel-downloads";
     }
     return std::filesystem::current_path() / "downloads";
 }
@@ -337,11 +337,11 @@ std::filesystem::path BuildAppDataDir()
 {
     const char* localAppData = std::getenv("LOCALAPPDATA");
     if (localAppData && *localAppData)
-        return std::filesystem::path(localAppData) / "apitool";
+        return std::filesystem::path(localAppData) / "squirrel";
     const char* userProfile = std::getenv("USERPROFILE");
     if (userProfile && *userProfile)
-        return std::filesystem::path(userProfile) / "AppData" / "Local" / "apitool";
-    return std::filesystem::current_path() / "apitool-data";
+        return std::filesystem::path(userProfile) / "AppData" / "Local" / "squirrel";
+    return std::filesystem::current_path() / "squirrel-data";
 }
 
 std::filesystem::path HistoryLogPath()
@@ -813,7 +813,7 @@ int main()
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
-    GLFWwindow* window = glfwCreateWindow(1280, 820, "apitool", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1280, 820, "squirrel", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
         return 1;

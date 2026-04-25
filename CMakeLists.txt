@@ -1,4 +1,4 @@
-# apitool — ImGui + GLFW + cpp-httplib（可选 HTTPS/OpenSSL），MSVC 下默认静态链接运行库 (/MT)。
+# squirrel — ImGui + GLFW + cpp-httplib（可选 HTTPS/OpenSSL），MSVC 下默认静态链接运行库 (/MT)。
 #
 # 配置与编译（64 位 Release，需已安装 Git 与 MSVC，且能访问 GitHub）:
 #   建议使用 vcpkg 安装 openssl，并在配置时传入工具链，例如:
@@ -8,7 +8,7 @@
 # 若启用动态链接 OpenSSL，请将 libssl / libcrypto 的 DLL 与 exe 同目录或一并打包进安装包。
 #
 cmake_minimum_required(VERSION 3.16)
-project(apitool VERSION 1.0.0 LANGUAGES CXX)
+project(squirrel VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -105,29 +105,29 @@ if(WIN32)
     target_link_libraries(imgui PUBLIC opengl32)
 endif()
 
-add_executable(apitool
+add_executable(squirrel
     src/main.cpp
     src/HttpWin.cpp
 )
-target_include_directories(apitool PRIVATE
+target_include_directories(squirrel PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${HTTPLIB_INCLUDE_DIR}
 )
-target_link_libraries(apitool PRIVATE imgui Threads::Threads)
+target_link_libraries(squirrel PRIVATE imgui Threads::Threads)
 if(APITOOL_ENABLE_HTTPS)
-    target_link_libraries(apitool PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    target_compile_definitions(apitool PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+    target_link_libraries(squirrel PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(squirrel PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 else()
-    target_compile_definitions(apitool PRIVATE APITOOL_HTTP_ONLY)
+    target_compile_definitions(squirrel PRIVATE APITOOL_HTTP_ONLY)
 endif()
 if(WIN32)
-    target_link_libraries(apitool PRIVATE ws2_32 crypt32)
-    set_target_properties(apitool PROPERTIES WIN32_EXECUTABLE TRUE)
-    target_compile_definitions(apitool PRIVATE UNICODE _UNICODE)
+    target_link_libraries(squirrel PRIVATE ws2_32 crypt32)
+    set_target_properties(squirrel PROPERTIES WIN32_EXECUTABLE TRUE)
+    target_compile_definitions(squirrel PRIVATE UNICODE _UNICODE)
 endif()
 
 if(MSVC)
-    target_compile_options(apitool PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(squirrel PRIVATE /W4 /permissive- /utf-8)
 else()
-    target_compile_options(apitool PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(squirrel PRIVATE -Wall -Wextra -Wpedantic)
 endif()

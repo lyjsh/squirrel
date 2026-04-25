@@ -217,7 +217,7 @@ HttpResult HttpRequestSync(const std::string& method,
     cli.set_connection_timeout(timeoutSeconds, 0);
     cli.set_read_timeout(timeoutSeconds, 0);
     cli.set_write_timeout(timeoutSeconds, 0);
-    cli.set_default_headers({{"User-Agent", "apitool/1.0 (cpp-httplib)"}});
+    cli.set_default_headers({{"User-Agent", "squirrel/1.0 (cpp-httplib)"}});
 
     httplib::Headers hdrs;
     bool hasContentType = false;
