@@ -30,6 +30,11 @@
 namespace {
 
 std::string TrimCopy(const std::string& s);
+enum class RowOp {
+    None,
+    Add,
+    Del
+};
 
 std::string ToUpper(std::string s)
 {
@@ -93,23 +98,6 @@ bool HistoryMatchesFilter(const char* filter, const std::string& method, const s
         pos = sp + 1;
     }
     return true;
-}
-
-// ImGui 会把标签里首次出现的 "##" 之后隐藏为 ID；URL 中若含 "##" 需打断，否则整段只剩极少可见字符。
-std::string EscapeImGuiLabel(const std::string& s)
-{
-    std::string o;
-    o.reserve(s.size() + 8);
-    for (size_t i = 0; i < s.size();) {
-        if (i + 1 < s.size() && s[i] == '#' && s[i + 1] == '#') {
-            o += "#\xE2\x80\x8B#"; // U+200B，避免被解析为 ##
-            i += 2;
-        } else {
-            o.push_back(s[i]);
-            ++i;
-        }
-    }
-    return o;
 }
 
 std::string UrlEncode(const std::string& s)
@@ -349,7 +337,13 @@ std::filesystem::path HistoryLogPath()
     return BuildAppDataDir() / "request_history.log";
 }
 
-void AppendHistoryLogLine(const std::string& method, const std::string& url)
+int64_t NowEpochMs()
+{
+    const auto now = std::chrono::system_clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+}
+
+void AppendHistoryLogLine(int64_t createdAtMs, const std::string& method, const std::string& url)
 {
     try {
         const std::filesystem::path p = HistoryLogPath();
@@ -357,9 +351,7 @@ void AppendHistoryLogLine(const std::string& method, const std::string& url)
         std::ofstream ofs(p, std::ios::app | std::ios::binary);
         if (!ofs)
             return;
-        const auto now = std::chrono::system_clock::now();
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-        ofs << ms << '\t' << UrlEncode(method) << '\t' << UrlEncode(url) << '\n';
+        ofs << createdAtMs << '\t' << UrlEncode(method) << '\t' << UrlEncode(url) << '\n';
     } catch (...) {
         // 日志写入失败不影响主流程
     }
@@ -588,6 +580,32 @@ bool MethodAllowsBody(const std::string& m)
     return m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE" || m == "OPTIONS";
 }
 
+bool LooksLikeHttpUrlInput(const std::string& rawUrl)
+{
+    const std::string u = TrimCopy(rawUrl);
+    if (u.empty())
+        return false;
+    if (u.front() == '{' || u.front() == '[')
+        return false;
+    if (u.find(' ') != std::string::npos || u.find('\t') != std::string::npos)
+        return false;
+
+    const size_t schemePos = u.find("://");
+    if (schemePos != std::string::npos) {
+        const std::string scheme = ToLowerCopy(u.substr(0, schemePos));
+        if (scheme != "http" && scheme != "https")
+            return false;
+        return schemePos + 3 < u.size();
+    }
+
+    // 无 scheme 也允许（后续会自动补），但至少要像 host（例如 localhost / 域名 / IPv4）
+    if (u == "localhost")
+        return true;
+    if (u.find('.') != std::string::npos)
+        return true;
+    return std::isdigit(static_cast<unsigned char>(u.front())) != 0;
+}
+
 // Postman 浅色主题（参考官方浅色界面）
 void ApplyPostmanLightStyle()
 {
@@ -669,6 +687,18 @@ void PopSendButtonStyle()
     ImGui::PopStyleColor(3);
 }
 
+bool DrawRowOpButton(const char* labelWithId)
+{
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.93f, 0.94f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.86f, 0.88f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.78f, 0.80f, 0.84f, 1.f));
+    const bool clicked = ImGui::SmallButton(labelWithId);
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar();
+    return clicked;
+}
+
 // 转圈加载（仅作进行中提示，与服务器响应时间无关）
 void DrawInlineSpinner(float radius, float thickness, ImU32 col)
 {
@@ -743,6 +773,7 @@ struct RequestHistoryEntry {
     std::string fingerprint;
     std::string method;
     std::string url;
+    int64_t createdAtMs = 0;
     std::vector<std::tuple<bool, std::string, std::string, std::string>> queryRows;
     std::vector<std::pair<std::string, std::string>> headerRows;
     int bodyMode = 0;
@@ -782,21 +813,51 @@ void LoadHistoryFromLog(std::vector<RequestHistoryEntry>& history)
             if (t2 == std::string::npos)
                 continue;
 
+            const std::string tsRaw = line.substr(0, t1);
             std::string method = PercentDecode(line.substr(t1 + 1, t2 - (t1 + 1)));
             std::string fullUrl = PercentDecode(line.substr(t2 + 1));
             method = ToUpper(TrimCopy(method));
             fullUrl = TrimCopy(fullUrl);
-            if (method.empty() || fullUrl.empty())
+            if (method.empty() || !LooksLikeHttpUrlInput(fullUrl))
                 continue;
+
+            int64_t createdAtMs = 0;
+            try {
+                createdAtMs = std::stoll(tsRaw);
+            } catch (...) {
+                createdAtMs = 0;
+            }
 
             RequestHistoryEntry he;
             he.method = method;
             he.url = fullUrl; // 已含 query，展示时按完整 URL 使用
+            he.createdAtMs = createdAtMs;
             he.fingerprint = RequestFingerprint(method, fullUrl, he.headerRows, "");
             PushHistoryUnique(history, std::move(he));
         }
     } catch (...) {
         // 历史加载失败不影响主流程
+    }
+}
+
+void RewriteHistoryLog(const std::vector<RequestHistoryEntry>& history)
+{
+    try {
+        const std::filesystem::path p = HistoryLogPath();
+        std::filesystem::create_directories(p.parent_path());
+        std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
+        if (!ofs)
+            return;
+
+        // 日志按时间从旧到新写入，保持可读性。
+        for (auto it = history.rbegin(); it != history.rend(); ++it) {
+            const RequestHistoryEntry& e = *it;
+            const int64_t ts = (e.createdAtMs > 0) ? e.createdAtMs : NowEpochMs();
+            const std::string fullUrl = MergeUrlQuery(e.url, e.queryRows);
+            ofs << ts << '\t' << UrlEncode(ToUpper(e.method)) << '\t' << UrlEncode(fullUrl) << '\n';
+        }
+    } catch (...) {
+        // 日志重写失败不影响主流程
     }
 }
 
@@ -861,7 +922,7 @@ int main()
     (void)HttpWinWarmup();
 
     std::string method = "GET";
-    std::string url = "https://httpbin.org/get";
+    std::string url;
     std::vector<std::tuple<bool, std::string, std::string, std::string>> queryRows;
     queryRows.emplace_back(true, std::string(), std::string(), std::string());
     std::vector<std::pair<std::string, std::string>> headerRows;
@@ -875,6 +936,12 @@ int main()
     std::string bodyFormatStatus;
     bool bodyFormatOk = true;
     std::string downloadLine;
+    int historyCleanupRange = 0;
+    std::string historyCleanupStatus;
+    bool settingsPanelOpen = false;
+    static bool settingsPanelWasOpen = false;
+    static ImVec2 settingsPanelStoredSize(520.f, 220.f);
+    float reqPaneRatio = 0.50f;
 
     std::string respBodyText;
     std::string respHdrText;
@@ -948,9 +1015,22 @@ int main()
         ImGui::Begin("main", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
+        const float menuBarH = 30.f;
+        ImGui::BeginChild("menu_bar", ImVec2(0, menuBarH), true, ImGuiWindowFlags_NoScrollbar);
+        {
+            const float lineH = ImGui::GetFrameHeight();
+            const float availY = ImGui::GetContentRegionAvail().y;
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::max(0.f, (availY - lineH) * 0.5f));
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("Menu");
+            ImGui::SameLine(ImGui::GetWindowWidth() - 92.f);
+            if (ImGui::Button("Settings", ImVec2(80.f, 0.f)))
+                settingsPanelOpen = true;
+        }
+        ImGui::EndChild();
+
         const float sidebarW = 268.f;
         const float mainH = ImGui::GetContentRegionAvail().y - 26.f;
-
         ImGui::BeginChild("main_row", ImVec2(0, mainH), false);
 
         ImGui::BeginChild("sidebar", ImVec2(sidebarW, 0), true);
@@ -962,6 +1042,37 @@ int main()
         ImGui::Separator();
         ImGui::BeginChild("hist_list", ImVec2(0, 0), false);
         bool anyShown = false;
+        int highlightedHistoryIdx = -1;
+        {
+            // 高亮与当前面板数据一致的历史项（优先严格匹配，退化为方法+完整URL匹配）
+            const std::string curMethod = ToUpper(method);
+            const std::string curFullUrl = MergeUrlQuery(url, queryRows);
+            for (int i = 0; i < static_cast<int>(requestHistory.size()); ++i) {
+                const RequestHistoryEntry& e = requestHistory[static_cast<size_t>(i)];
+                if (ToUpper(e.method) == curMethod
+                    && e.url == url
+                    && e.queryRows == queryRows
+                    && e.headerRows == headerRows
+                    && e.bodyMode == bodyMode
+                    && e.reqBody == reqBody
+                    && e.rawContentTypeMode == rawContentTypeMode
+                    && e.formRows == formRows) {
+                    highlightedHistoryIdx = i;
+                    break;
+                }
+            }
+            if (highlightedHistoryIdx < 0) {
+                for (int i = 0; i < static_cast<int>(requestHistory.size()); ++i) {
+                    const RequestHistoryEntry& e = requestHistory[static_cast<size_t>(i)];
+                    if (ToUpper(e.method) == curMethod
+                        && MergeUrlQuery(e.url, e.queryRows) == curFullUrl) {
+                        highlightedHistoryIdx = i;
+                        break;
+                    }
+                }
+            }
+        }
+        selectedHistoryIdx = highlightedHistoryIdx;
         for (int i = 0; i < static_cast<int>(requestHistory.size()); ++i) {
             const RequestHistoryEntry& e = requestHistory[static_cast<size_t>(i)];
             const std::string full = MergeUrlQuery(e.url, e.queryRows);
@@ -970,10 +1081,12 @@ int main()
             anyShown = true;
 
             ImGui::PushID(i);
-            const std::string esc = EscapeImGuiLabel(full);
             const bool sel = (selectedHistoryIdx == i);
-            const std::string rowLabel = ToUpper(e.method) + "  " + esc;
-            if (ImGui::Selectable(rowLabel.c_str(), sel, 0, ImVec2(-1.f, 0.f))) {
+            const float rowH = ImGui::GetTextLineHeightWithSpacing() + 4.f;
+            // 不要用 width=-1：部分 ImGui 版本下 Selectable 会得到无效/不可见命中框，点击不触发。
+            // 也不用 ImGuiSelectableFlags_SpanAvailWidth：旧版 ImGui 无该枚举；显式用当前行可用宽度即可。
+            const float rowW = std::max(1.f, ImGui::GetContentRegionAvail().x);
+            if (ImGui::Selectable("##histrow", sel, 0, ImVec2(rowW, rowH))) {
                 selectedHistoryIdx = i;
                 method = e.method;
                 url = e.url;
@@ -991,6 +1104,33 @@ int main()
                     formRows.emplace_back(true, std::string(), std::string());
             }
 
+            const ImVec2 rowMin = ImGui::GetItemRectMin();
+            const ImVec2 rowMax = ImGui::GetItemRectMax();
+            const float textY = rowMin.y + (rowMax.y - rowMin.y - ImGui::GetTextLineHeight()) * 0.5f;
+            const float textX = rowMin.x + 6.f;
+
+            const std::string m = ToUpper(e.method);
+            ImVec4 mcol(0.15f, 0.15f, 0.18f, 1.f);
+            if (m == "GET")
+                mcol = ImVec4(0.12f, 0.62f, 0.35f, 1.f);
+            else if (m == "POST")
+                mcol = ImVec4(0.95f, 0.50f, 0.15f, 1.f);
+            else if (m == "PUT")
+                mcol = ImVec4(0.20f, 0.45f, 0.85f, 1.f);
+            else if (m == "PATCH")
+                mcol = ImVec4(0.55f, 0.35f, 0.85f, 1.f);
+            else if (m == "DELETE")
+                mcol = ImVec4(0.90f, 0.25f, 0.22f, 1.f);
+
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddText(ImVec2(textX, textY), ImGui::GetColorU32(mcol), m.c_str());
+            const float methodW = ImGui::CalcTextSize(m.c_str()).x;
+            const float urlX = textX + methodW + 10.f;
+            const float urlMaxX = rowMax.x - 6.f;
+            ImGui::PushClipRect(ImVec2(urlX, rowMin.y), ImVec2(urlMaxX, rowMax.y), true);
+            dl->AddText(ImVec2(urlX, textY), ImGui::GetColorU32(ImGuiCol_Text), full.c_str());
+            ImGui::PopClipRect();
+
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("%s", full.c_str());
             ImGui::PopID();
@@ -1004,7 +1144,8 @@ int main()
 
         ImGui::SameLine();
 
-        ImGui::BeginChild("workspace", ImVec2(0, 0), true);
+        const ImGuiWindowFlags workspaceChildFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+        ImGui::BeginChild("workspace", ImVec2(0, 0), true, workspaceChildFlags);
 
         if (ImGui::BeginTabBar("reqwin_tabs", ImGuiTabBarFlags_DrawSelectedOverline)) {
             if (ImGui::BeginTabItem("HTTP 请求")) {
@@ -1048,83 +1189,99 @@ int main()
                 ImGui::SetTooltip("此处为本地已等待时间（界面实时刷新）。完成后响应区「耗时」为整次请求在客户端测得的往返时间。");
             ImGui::SameLine();
             if (ImGui::Button("取消", ImVec2(72, 0)))
+            {
+                statusLine = "取消中…";
                 HttpRequestCancel(&httpCancel);
+            }
         } else {
             PushSendButtonStyle();
             if (ImGui::Button("Send", ImVec2(96, 0)) && !inFlight.load()) {
-                HttpCancelToken_reset(&httpCancel);
-                reqStartTime = ImGui::GetTime();
-                inFlight = true;
-                statusLine = "请求中…";
-                timeLine.clear();
-                respHdrText.clear();
-                respBodyText.clear();
-                lastHttpCode = 0;
-                lastBodyBytes = 0;
+                const bool validUrl = LooksLikeHttpUrlInput(url);
+                if (!validUrl) {
+                    statusLine = "错误";
+                    timeLine.clear();
+                    respHdrText.clear();
+                    respBodyText = "URL 无效：请输入 http(s) 地址或域名（例如 https://example.com）";
+                    lastHttpCode = 0;
+                    lastBodyBytes = 0;
+                    downloadLine.clear();
+                } else {
+                    HttpCancelToken_reset(&httpCancel);
+                    reqStartTime = ImGui::GetTime();
+                    inFlight = true;
+                    statusLine = "请求中…";
+                    timeLine.clear();
+                    respHdrText.clear();
+                    respBodyText.clear();
+                    lastHttpCode = 0;
+                    lastBodyBytes = 0;
 
-                const std::string m = ToUpper(method);
-                std::string fullUrl = MergeUrlQuery(url, queryRows);
-                std::vector<HttpHeader> hdrs;
-                for (const auto& p : headerRows) {
-                    if (p.first.empty())
-                        continue;
-                    hdrs.emplace_back(p.first, p.second);
-                }
-                std::string bodyOut;
-                std::string bodyContentType;
-                if (bodyMode == 1 && MethodAllowsBody(m))
-                    bodyOut = reqBody;
-                else if (bodyMode == 2 && MethodAllowsBody(m)) {
-                    bodyOut = BuildFormUrlEncoded(formRows);
-                    bodyContentType = "application/x-www-form-urlencoded";
-                }
-
-                if (bodyMode == 1 && MethodAllowsBody(m)) {
-                    if (rawContentTypeMode == 0)
-                        bodyContentType = "application/json; charset=utf-8";
-                    else if (rawContentTypeMode == 1)
-                        bodyContentType = "text/plain; charset=utf-8";
-                    else
-                        bodyContentType = "application/xml; charset=utf-8";
-                }
-
-                if (!bodyOut.empty() && !bodyContentType.empty()) {
-                    bool hasContentType = false;
-                    for (const auto& h : hdrs) {
-                        if (ToLowerStr(h.first) == "content-type") {
-                            hasContentType = true;
-                            break;
-                        }
+                    const std::string m = ToUpper(method);
+                    std::string fullUrl = MergeUrlQuery(url, queryRows);
+                    std::vector<HttpHeader> hdrs;
+                    for (const auto& p : headerRows) {
+                        if (p.first.empty())
+                            continue;
+                        hdrs.emplace_back(p.first, p.second);
                     }
-                    if (!hasContentType)
-                        hdrs.emplace_back("Content-Type", bodyContentType);
-                }
+                    std::string bodyOut;
+                    std::string bodyContentType;
+                    if (bodyMode == 1 && MethodAllowsBody(m))
+                        bodyOut = reqBody;
+                    else if (bodyMode == 2 && MethodAllowsBody(m)) {
+                        bodyOut = BuildFormUrlEncoded(formRows);
+                        bodyContentType = "application/x-www-form-urlencoded";
+                    }
 
-                {
-                    RequestHistoryEntry he;
-                    he.fingerprint = RequestFingerprint(m, fullUrl, headerRows, bodyOut);
-                    he.method = method;
-                    he.url = url;
-                    he.queryRows = queryRows;
-                    he.headerRows = headerRows;
-                    he.bodyMode = bodyMode;
-                    he.reqBody = reqBody;
-                    he.rawContentTypeMode = rawContentTypeMode;
-                    he.formRows = formRows;
-                    PushHistoryUnique(requestHistory, std::move(he));
-                    AppendHistoryLogLine(m, fullUrl);
-                    selectedHistoryIdx = 0;
-                }
+                    if (bodyMode == 1 && MethodAllowsBody(m)) {
+                        if (rawContentTypeMode == 0)
+                            bodyContentType = "application/json; charset=utf-8";
+                        else if (rawContentTypeMode == 1)
+                            bodyContentType = "text/plain; charset=utf-8";
+                        else
+                            bodyContentType = "application/xml; charset=utf-8";
+                    }
 
-                AsyncSlot* slot = &async;
-                HttpCancelToken* pcancel = &httpCancel;
-                const int timeoutSec = requestTimeoutSec;
-                std::thread([slot, m, fullUrl, hdrs, bodyOut, pcancel, timeoutSec]() {
-                    HttpResult r = HttpRequestSync(m, fullUrl, hdrs, bodyOut, pcancel, timeoutSec);
-                    std::lock_guard<std::mutex> lock(slot->mtx);
-                    slot->result = std::move(r);
-                    slot->finished = true;
-                }).detach();
+                    if (!bodyOut.empty() && !bodyContentType.empty()) {
+                        bool hasContentType = false;
+                        for (const auto& h : hdrs) {
+                            if (ToLowerStr(h.first) == "content-type") {
+                                hasContentType = true;
+                                break;
+                            }
+                        }
+                        if (!hasContentType)
+                            hdrs.emplace_back("Content-Type", bodyContentType);
+                    }
+
+                    {
+                        const int64_t createdAtMs = NowEpochMs();
+                        RequestHistoryEntry he;
+                        he.fingerprint = RequestFingerprint(m, fullUrl, headerRows, bodyOut);
+                        he.method = method;
+                        he.url = url;
+                        he.createdAtMs = createdAtMs;
+                        he.queryRows = queryRows;
+                        he.headerRows = headerRows;
+                        he.bodyMode = bodyMode;
+                        he.reqBody = reqBody;
+                        he.rawContentTypeMode = rawContentTypeMode;
+                        he.formRows = formRows;
+                        PushHistoryUnique(requestHistory, std::move(he));
+                        AppendHistoryLogLine(createdAtMs, m, fullUrl);
+                        selectedHistoryIdx = 0;
+                    }
+
+                    AsyncSlot* slot = &async;
+                    HttpCancelToken* pcancel = &httpCancel;
+                    const int timeoutSec = requestTimeoutSec;
+                    std::thread([slot, m, fullUrl, hdrs, bodyOut, pcancel, timeoutSec]() {
+                        HttpResult r = HttpRequestSync(m, fullUrl, hdrs, bodyOut, pcancel, timeoutSec);
+                        std::lock_guard<std::mutex> lock(slot->mtx);
+                        slot->result = std::move(r);
+                        slot->finished = true;
+                    }).detach();
+                }
             }
             PopSendButtonStyle();
         }
@@ -1132,10 +1289,19 @@ int main()
 
         ImGui::Spacing();
 
-        const float reqBlockH = std::max(220.f, ImGui::GetContentRegionAvail().y * 0.48f);
-        ImGui::BeginChild("req_tabs_region", ImVec2(0, reqBlockH), true);
+        const float splitterH = 8.f;
+        const float totalH = ImGui::GetContentRegionAvail().y;
+        const float minPaneH = 140.f;
+        const float maxReqH = std::max(minPaneH, totalH - minPaneH - splitterH);
+        const float reqBlockH = std::clamp(totalH * reqPaneRatio, minPaneH, maxReqH);
+        const float respBlockH = std::max(minPaneH, totalH - reqBlockH - splitterH);
+
+        const ImGuiWindowFlags reqTabChildFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+        ImGui::BeginChild("req_tabs_region", ImVec2(0, reqBlockH), true, reqTabChildFlags);
         if (ImGui::BeginTabBar("rtabs", ImGuiTabBarFlags_DrawSelectedOverline)) {
             if (ImGui::BeginTabItem("Params")) {
+                RowOp qOp = RowOp::None;
+                int qOpAt = -1;
                 if (ImGui::BeginTable("pt", 4,
                                       ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersOuterH
                                           | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
@@ -1151,9 +1317,21 @@ int main()
                         ImGui::Checkbox(("##qon" + std::to_string(i)).c_str(), &on);
                         std::get<0>(queryRows[i]) = on;
                         ImGui::TableSetColumnIndex(1);
-                        ImGui::PushItemWidth(-1);
+                        const float btnW = 22.f;
+                        const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+                        ImGui::PushItemWidth(std::max(40.f, ImGui::GetContentRegionAvail().x - (btnW * 2.f + spacing * 2.f)));
                         ImGui::InputText(("##qk" + std::to_string(i)).c_str(), &std::get<1>(queryRows[i]));
                         ImGui::PopItemWidth();
+                        ImGui::SameLine();
+                        if (DrawRowOpButton(("+##qadd" + std::to_string(i)).c_str())) {
+                            qOp = RowOp::Add;
+                            qOpAt = static_cast<int>(i);
+                        }
+                        ImGui::SameLine();
+                        if (DrawRowOpButton(("-##qdel" + std::to_string(i)).c_str())) {
+                            qOp = RowOp::Del;
+                            qOpAt = static_cast<int>(i);
+                        }
                         ImGui::TableSetColumnIndex(2);
                         ImGui::PushItemWidth(-1);
                         ImGui::InputText(("##qv" + std::to_string(i)).c_str(), &std::get<2>(queryRows[i]));
@@ -1165,11 +1343,16 @@ int main()
                     }
                     ImGui::EndTable();
                 }
-                if (ImGui::Button("添加参数"))
-                    queryRows.emplace_back(true, std::string(), std::string(), std::string());
-                ImGui::SameLine();
-                if (ImGui::Button("删除最后一行") && queryRows.size() > 1)
-                    queryRows.pop_back();
+                if (qOp == RowOp::Add && qOpAt >= 0) {
+                    queryRows.insert(queryRows.begin() + (qOpAt + 1),
+                                     std::make_tuple(true, std::string(), std::string(), std::string()));
+                }
+                if (qOp == RowOp::Del && qOpAt >= 0) {
+                    if (queryRows.size() > 1)
+                        queryRows.erase(queryRows.begin() + qOpAt);
+                    else
+                        queryRows[0] = std::make_tuple(true, std::string(), std::string(), std::string());
+                }
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Auth")) {
@@ -1177,6 +1360,8 @@ int main()
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Headers##req_headers")) {
+                RowOp hOp = RowOp::None;
+                int hOpAt = -1;
                 if (ImGui::BeginTable("ht", 2,
                                       ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
                     ImGui::TableSetupColumn("Key");
@@ -1185,9 +1370,21 @@ int main()
                     for (size_t i = 0; i < headerRows.size(); ++i) {
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
-                        ImGui::PushItemWidth(-1);
+                        const float btnW = 22.f;
+                        const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+                        ImGui::PushItemWidth(std::max(40.f, ImGui::GetContentRegionAvail().x - (btnW * 2.f + spacing * 2.f)));
                         ImGui::InputText(("##hk" + std::to_string(i)).c_str(), &headerRows[i].first);
                         ImGui::PopItemWidth();
+                        ImGui::SameLine();
+                        if (DrawRowOpButton(("+##hadd" + std::to_string(i)).c_str())) {
+                            hOp = RowOp::Add;
+                            hOpAt = static_cast<int>(i);
+                        }
+                        ImGui::SameLine();
+                        if (DrawRowOpButton(("-##hdel" + std::to_string(i)).c_str())) {
+                            hOp = RowOp::Del;
+                            hOpAt = static_cast<int>(i);
+                        }
                         ImGui::TableSetColumnIndex(1);
                         ImGui::PushItemWidth(-1);
                         ImGui::InputText(("##hv" + std::to_string(i)).c_str(), &headerRows[i].second);
@@ -1195,11 +1392,14 @@ int main()
                     }
                     ImGui::EndTable();
                 }
-                if (ImGui::Button("添加 Header"))
-                    headerRows.emplace_back();
-                ImGui::SameLine();
-                if (ImGui::Button("删除最后一行") && headerRows.size() > 1)
-                    headerRows.pop_back();
+                if (hOp == RowOp::Add && hOpAt >= 0)
+                    headerRows.insert(headerRows.begin() + (hOpAt + 1), std::make_pair(std::string(), std::string()));
+                if (hOp == RowOp::Del && hOpAt >= 0) {
+                    if (headerRows.size() > 1)
+                        headerRows.erase(headerRows.begin() + hOpAt);
+                    else
+                        headerRows[0] = std::make_pair(std::string(), std::string());
+                }
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Body##req_body")) {
@@ -1249,6 +1449,8 @@ int main()
                     ImGui::InputTextMultiline("##body", &reqBody, ImVec2(-1, -40.f));
                     ImGui::PopFont();
                 } else if (bodyMode == 2) {
+                    RowOp fOp = RowOp::None;
+                    int fOpAt = -1;
                     if (ImGui::BeginTable("form_body_tbl", 3,
                                           ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
                         ImGui::TableSetupColumn("启用", ImGuiTableColumnFlags_WidthFixed, 48.f);
@@ -1262,9 +1464,21 @@ int main()
                             ImGui::Checkbox(("##fon" + std::to_string(i)).c_str(), &on);
                             std::get<0>(formRows[i]) = on;
                             ImGui::TableSetColumnIndex(1);
-                            ImGui::PushItemWidth(-1);
+                            const float btnW = 22.f;
+                            const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+                            ImGui::PushItemWidth(std::max(40.f, ImGui::GetContentRegionAvail().x - (btnW * 2.f + spacing * 2.f)));
                             ImGui::InputText(("##fk" + std::to_string(i)).c_str(), &std::get<1>(formRows[i]));
                             ImGui::PopItemWidth();
+                            ImGui::SameLine();
+                            if (DrawRowOpButton(("+##fadd" + std::to_string(i)).c_str())) {
+                                fOp = RowOp::Add;
+                                fOpAt = static_cast<int>(i);
+                            }
+                            ImGui::SameLine();
+                            if (DrawRowOpButton(("-##fdel" + std::to_string(i)).c_str())) {
+                                fOp = RowOp::Del;
+                                fOpAt = static_cast<int>(i);
+                            }
                             ImGui::TableSetColumnIndex(2);
                             ImGui::PushItemWidth(-1);
                             ImGui::InputText(("##fv" + std::to_string(i)).c_str(), &std::get<2>(formRows[i]));
@@ -1272,11 +1486,15 @@ int main()
                         }
                         ImGui::EndTable();
                     }
-                    if (ImGui::Button("添加字段"))
-                        formRows.emplace_back(true, std::string(), std::string());
-                    ImGui::SameLine();
-                    if (ImGui::Button("删除最后一行") && formRows.size() > 1)
-                        formRows.pop_back();
+                    if (fOp == RowOp::Add && fOpAt >= 0)
+                        formRows.insert(formRows.begin() + (fOpAt + 1),
+                                        std::make_tuple(true, std::string(), std::string()));
+                    if (fOp == RowOp::Del && fOpAt >= 0) {
+                        if (formRows.size() > 1)
+                            formRows.erase(formRows.begin() + fOpAt);
+                        else
+                            formRows[0] = std::make_tuple(true, std::string(), std::string());
+                    }
                     ImGui::TextDisabled("发送时将自动编码并补充 Content-Type: application/x-www-form-urlencoded");
                 }
                 ImGui::EndDisabled();
@@ -1289,17 +1507,33 @@ int main()
                 ImGui::TextDisabled("Pre-request / Tests（占位）");
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Settings")) {
-                ImGui::TextDisabled("请求级设置（占位）");
-                ImGui::EndTabItem();
-            }
             ImGui::EndTabBar();
         }
         ImGui::EndChild();
 
-        ImGui::Spacing();
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.f);
+        ImGui::InvisibleButton("req_resp_splitter", ImVec2(-1.f, splitterH));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            const float dy = ImGui::GetIO().MouseDelta.y;
+            if (totalH > 1.f) {
+                reqPaneRatio = std::clamp(reqPaneRatio + dy / totalH, 0.20f, 0.80f);
+            }
+        }
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 a = ImGui::GetItemRectMin();
+            const ImVec2 b = ImGui::GetItemRectMax();
+            const ImU32 col = ImGui::GetColorU32(ImGui::IsItemActive()
+                                                     ? ImVec4(1.0f, 0.424f, 0.216f, 0.85f)
+                                                     : ImVec4(0.75f, 0.75f, 0.78f, 0.9f));
+            const float y = (a.y + b.y) * 0.5f;
+            dl->AddLine(ImVec2(a.x + 8.f, y), ImVec2(b.x - 8.f, y), col, 2.0f);
+        }
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.f);
 
-        ImGui::BeginChild("resp_region", ImVec2(0, 0), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+        ImGui::BeginChild("resp_region", ImVec2(0, respBlockH), true);
         ImGui::AlignTextToFramePadding();
         ImGui::TextColored(StatusLineColor(lastHttpCode), "%s", statusLine.c_str());
         ImGui::SameLine();
@@ -1354,6 +1588,67 @@ int main()
         ImGui::EndChild();
 
         ImGui::End();
+
+        const bool settingsPanelJustOpened = settingsPanelOpen && !settingsPanelWasOpen;
+        if (settingsPanelJustOpened) {
+            const ImGuiViewport* svp = ImGui::GetMainViewport();
+            const ImVec2 workPos = svp->WorkPos;
+            const ImVec2 workSize = svp->WorkSize;
+            const ImVec2 winSize = settingsPanelStoredSize;
+            ImGui::SetNextWindowPos(
+                ImVec2(workPos.x + (workSize.x - winSize.x) * 0.5f, workPos.y + (workSize.y - winSize.y) * 0.5f),
+                ImGuiCond_Always);
+            ImGui::SetNextWindowSize(winSize, ImGuiCond_Always);
+        }
+
+        if (settingsPanelOpen) {
+            if (ImGui::Begin("Settings Panel", &settingsPanelOpen, ImGuiWindowFlags_NoCollapse)) {
+                settingsPanelStoredSize = ImGui::GetWindowSize();
+                ImGui::TextUnformatted("历史记录管理");
+                ImGui::Separator();
+                const char* cleanupRanges[] = {"1个月前", "3个月前", "6个月前", "1年前"};
+                ImGui::SetNextItemWidth(180.f);
+                ImGui::Combo("清理范围", &historyCleanupRange, cleanupRanges, IM_ARRAYSIZE(cleanupRanges));
+                ImGui::SameLine();
+                if (ImGui::Button("清理该时间之前历史")) {
+                    int days = 30;
+                    if (historyCleanupRange == 1)
+                        days = 90;
+                    else if (historyCleanupRange == 2)
+                        days = 180;
+                    else if (historyCleanupRange == 3)
+                        days = 365;
+                    const int64_t cutoffMs = NowEpochMs() - static_cast<int64_t>(days) * 24 * 60 * 60 * 1000;
+
+                    const size_t before = requestHistory.size();
+                    requestHistory.erase(
+                        std::remove_if(requestHistory.begin(), requestHistory.end(),
+                                       [&](const RequestHistoryEntry& e) {
+                                           return e.createdAtMs > 0 && e.createdAtMs < cutoffMs;
+                                       }),
+                        requestHistory.end());
+                    const size_t removed = before - requestHistory.size();
+                    RewriteHistoryLog(requestHistory);
+                    if (selectedHistoryIdx >= static_cast<int>(requestHistory.size()))
+                        selectedHistoryIdx = -1;
+                    historyCleanupStatus = "已清理 " + std::to_string(removed) + " 条历史记录";
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("清空全部历史")) {
+                    requestHistory.clear();
+                    selectedHistoryIdx = -1;
+                    RewriteHistoryLog(requestHistory);
+                    historyCleanupStatus = "历史记录已全部清空";
+                }
+
+                if (!historyCleanupStatus.empty()) {
+                    ImGui::Spacing();
+                    ImGui::TextDisabled("%s", historyCleanupStatus.c_str());
+                }
+            }
+            ImGui::End();
+        }
+        settingsPanelWasOpen = settingsPanelOpen;
 
         ImGui::Render();
         const int display_w = static_cast<int>(io.DisplaySize.x);

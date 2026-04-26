@@ -130,4 +130,8 @@ if(MSVC)
     target_compile_options(squirrel PRIVATE /W4 /permissive- /utf-8)
 else()
     target_compile_options(squirrel PRIVATE -Wall -Wextra -Wpedantic)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        # MinGW/GCC 下显式指定源码与执行字符集为 UTF-8，避免中文字符串显示为乱码。
+        target_compile_options(squirrel PRIVATE -finput-charset=UTF-8 -fexec-charset=UTF-8)
+    endif()
 endif()

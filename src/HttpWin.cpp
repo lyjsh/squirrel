@@ -148,15 +148,19 @@ void HttpRequestCancel(HttpCancelToken* token)
     if (!token)
         return;
     token->cancelled.store(true);
-    // 避免在 UI 线程里直接 stop() 造成短暂卡顿：改为后台执行取消。
-    std::thread([token]() {
+    // 先在锁内取出指针，再在锁外 stop()，避免与析构阶段互锁导致取消失效。
+    httplib::Client* client = nullptr;
+    {
         std::lock_guard<std::mutex> lock(token->mtx);
-        if (!token->hRequest)
-            return;
-        auto* client = static_cast<httplib::Client*>(token->hRequest);
-        token->hRequest = nullptr;
-        client->stop();
-    }).detach();
+        if (token->hRequest) {
+            client = static_cast<httplib::Client*>(token->hRequest);
+            token->hRequest = nullptr;
+        }
+    }
+    if (client) {
+        // 避免阻塞 UI 线程。
+        std::thread([client]() { client->stop(); }).detach();
+    }
 }
 
 HttpResult HttpRequestSync(const std::string& method,
@@ -193,7 +197,7 @@ HttpResult HttpRequestSync(const std::string& method,
     out.requestUrlUtf8 = url;
 #if !defined(CPPHTTPLIB_OPENSSL_SUPPORT)
     if (https) {
-        out.errorMessage = ErrMsg("当前构建未启用 HTTPS（缺少 OpenSSL）");
+        out.errorMessage = ErrMsg("HTTPS is unavailable in this build (OpenSSL not found)");
         return out;
     }
 #endif
