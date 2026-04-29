@@ -6,6 +6,8 @@
 #   cmake --build build --config Release
 #
 # 若启用动态链接 OpenSSL，请将 libssl / libcrypto 的 DLL 与 exe 同目录或一并打包进安装包。
+# 独立单文件 exe（无外部 DLL）：MSVC + vcpkg 用 x64-windows-static，或运行 scripts\build-standalone.ps1；
+# CLion 选 MinGW 时：不链 Threads::Threads；链接末尾追加 -static，避免 libwinpthread/libgcc 等运行时 DLL。
 #
 cmake_minimum_required(VERSION 3.16)
 project(squirrel VERSION 1.0.0 LANGUAGES CXX)
@@ -113,7 +115,12 @@ target_include_directories(squirrel PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${HTTPLIB_INCLUDE_DIR}
 )
-target_link_libraries(squirrel PRIVATE imgui Threads::Threads)
+# MinGW 上 Threads::Threads 会注入 -pthread，从而优先链入 libwinpthread.dll.a，运行仍缺 libwinpthread-1.dll。
+# Windows 下 cpp-httplib 走 _WIN32 分支不依赖 pthread；GLFW 在 Windows 用原生线程。此处改用 -mthreads 即可。
+target_link_libraries(squirrel PRIVATE imgui)
+if(NOT MINGW)
+    target_link_libraries(squirrel PRIVATE Threads::Threads)
+endif()
 if(APITOOL_ENABLE_HTTPS)
     target_link_libraries(squirrel PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(squirrel PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
@@ -125,6 +132,10 @@ if(WIN32)
     set_target_properties(squirrel PROPERTIES WIN32_EXECUTABLE TRUE)
     target_compile_definitions(squirrel PRIVATE UNICODE _UNICODE)
 endif()
+if(MINGW)
+    target_compile_options(squirrel PRIVATE -mthreads)
+    target_link_options(squirrel PRIVATE -mthreads)
+endif()
 
 if(MSVC)
     target_compile_options(squirrel PRIVATE /W4 /permissive- /utf-8)
@@ -134,4 +145,10 @@ else()
         # MinGW/GCC 下显式指定源码与执行字符集为 UTF-8，避免中文字符串显示为乱码。
         target_compile_options(squirrel PRIVATE -finput-charset=UTF-8 -fexec-charset=UTF-8)
     endif()
+endif()
+
+# MinGW：放在所有其它库之后追加 -static，强制静态链入 winpthread/libgcc/libstdc++ 等，避免运行缺 DLL。
+# 若启用 HTTPS 且仅有 OpenSSL 的 DLL 导入库导致链接失败，可配置 -DAPITOOL_ENABLE_HTTPS=OFF 或换 MSVC+vcpkg。
+if(MINGW)
+    target_link_libraries(squirrel PRIVATE -static)
 endif()
