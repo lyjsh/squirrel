@@ -1,4 +1,5 @@
 #include "HttpWin.h"
+#include "JsonHighlight.h"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -191,6 +193,46 @@ std::string PercentDecode(const std::string& s)
     return out;
 }
 
+void SplitUrlAndQuery(const std::string& fullUrl, std::string& baseUrl,
+                      std::vector<std::tuple<bool, std::string, std::string, std::string>>& queryRows)
+{
+    queryRows.clear();
+    const size_t schemePos = fullUrl.find("://");
+    const size_t searchFrom = (schemePos == std::string::npos) ? 0 : schemePos + 3;
+    const size_t qPos = fullUrl.find('?', searchFrom);
+    if (qPos == std::string::npos) {
+        baseUrl = fullUrl;
+        queryRows.emplace_back(true, std::string(), std::string(), std::string());
+        return;
+    }
+
+    baseUrl = fullUrl.substr(0, qPos);
+    std::string query = fullUrl.substr(qPos + 1);
+    const size_t hashPos = query.find('#');
+    if (hashPos != std::string::npos)
+        query = query.substr(0, hashPos);
+
+    if (query.empty()) {
+        queryRows.emplace_back(true, std::string(), std::string(), std::string());
+        return;
+    }
+
+    size_t pos = 0;
+    while (pos < query.size()) {
+        const size_t amp = query.find('&', pos);
+        std::string pair = (amp == std::string::npos) ? query.substr(pos) : query.substr(pos, amp - pos);
+        pos = (amp == std::string::npos) ? query.size() : amp + 1;
+        if (pair.empty())
+            continue;
+        const size_t eq = pair.find('=');
+        const std::string k = PercentDecode(eq == std::string::npos ? pair : pair.substr(0, eq));
+        const std::string v = PercentDecode(eq == std::string::npos ? std::string() : pair.substr(eq + 1));
+        queryRows.emplace_back(true, k, v, std::string());
+    }
+    if (queryRows.empty())
+        queryRows.emplace_back(true, std::string(), std::string(), std::string());
+}
+
 std::string ToLowerAscii(std::string s)
 {
     for (char& c : s)
@@ -343,20 +385,6 @@ int64_t NowEpochMs()
     return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 }
 
-void AppendHistoryLogLine(int64_t createdAtMs, const std::string& method, const std::string& url)
-{
-    try {
-        const std::filesystem::path p = HistoryLogPath();
-        std::filesystem::create_directories(p.parent_path());
-        std::ofstream ofs(p, std::ios::app | std::ios::binary);
-        if (!ofs)
-            return;
-        ofs << createdAtMs << '\t' << UrlEncode(method) << '\t' << UrlEncode(url) << '\n';
-    } catch (...) {
-        // 日志写入失败不影响主流程
-    }
-}
-
 bool SaveResponseToFile(const HttpResult& r, std::filesystem::path& outPath, std::string& err)
 {
     err.clear();
@@ -425,7 +453,8 @@ bool PrettyFormatJson(const std::string& input, std::string& output, std::string
     bool inString = false;
     bool escape = false;
     std::vector<char> stack;
-    auto putIndent = [&]() { output.append(static_cast<size_t>(indent) * 2, ' '); };
+    constexpr int kJsonIndentSpaces = 4;
+    auto putIndent = [&]() { output.append(static_cast<size_t>(indent) * kJsonIndentSpaces, ' '); };
 
     for (char c : input) {
         if (inString) {
@@ -606,96 +635,155 @@ bool LooksLikeHttpUrlInput(const std::string& rawUrl)
     return std::isdigit(static_cast<unsigned char>(u.front())) != 0;
 }
 
-// Postman 浅色主题（参考官方浅色界面）
-void ApplyPostmanLightStyle()
+// Google Material Design 3 浅色主题（Primary #1A73E8）
+namespace Material {
+constexpr ImVec4 kPrimary(0.102f, 0.451f, 0.910f, 1.f);
+constexpr ImVec4 kPrimaryHover(0.098f, 0.404f, 0.824f, 1.f);
+constexpr ImVec4 kPrimaryActive(0.082f, 0.349f, 0.706f, 1.f);
+constexpr ImVec4 kOnPrimary(1.f, 1.f, 1.f, 1.f);
+constexpr ImVec4 kPrimaryContainer(0.827f, 0.890f, 0.992f, 1.f);
+constexpr ImVec4 kSurface(1.f, 1.f, 1.f, 1.f);
+constexpr ImVec4 kSurfaceDim(0.973f, 0.976f, 0.980f, 1.f);
+constexpr ImVec4 kSurfaceVariant(0.945f, 0.953f, 0.957f, 1.f);
+constexpr ImVec4 kOutline(0.855f, 0.863f, 0.878f, 1.f);
+constexpr ImVec4 kOnSurface(0.125f, 0.129f, 0.141f, 1.f);
+constexpr ImVec4 kOnSurfaceVariant(0.373f, 0.388f, 0.408f, 1.f);
+constexpr ImVec4 kSuccess(0.094f, 0.502f, 0.220f, 1.f);
+constexpr ImVec4 kWarning(0.890f, 0.455f, 0.039f, 1.f);
+constexpr ImVec4 kError(0.851f, 0.188f, 0.145f, 1.f);
+} // namespace Material
+
+void ApplyMaterialTheme()
 {
     ImGuiStyle& st = ImGui::GetStyle();
-    st.FrameRounding = 4.f;
-    st.WindowRounding = 0.f;
-    st.ChildRounding = 4.f;
-    st.PopupRounding = 4.f;
-    st.ScrollbarRounding = 4.f;
-    st.GrabRounding = 4.f;
-    st.TabRounding = 4.f;
-    st.WindowPadding = ImVec2(12, 10);
-    st.FramePadding = ImVec2(10, 6);
-    st.ItemSpacing = ImVec2(10, 8);
-    st.ItemInnerSpacing = ImVec2(8, 6);
-    st.WindowBorderSize = 1.f;
-    st.ChildBorderSize = 1.f;
+    st.FrameRounding = 8.f;
+    st.WindowRounding = 12.f;
+    st.ChildRounding = 12.f;
+    st.PopupRounding = 12.f;
+    st.ScrollbarRounding = 8.f;
+    st.GrabRounding = 8.f;
+    st.TabRounding = 8.f;
+    st.WindowPadding = ImVec2(16.f, 14.f);
+    st.FramePadding = ImVec2(14.f, 10.f);
+    st.ItemSpacing = ImVec2(12.f, 10.f);
+    st.ItemInnerSpacing = ImVec2(8.f, 6.f);
+    st.WindowBorderSize = 0.f;
+    st.ChildBorderSize = 0.f;
     st.FrameBorderSize = 1.f;
+    st.PopupBorderSize = 1.f;
+    st.TabBarBorderSize = 0.f;
 
+    using namespace Material;
     ImVec4* c = st.Colors;
-    const ImVec4 white(1.f, 1.f, 1.f, 1.f);
-    const ImVec4 bgPage(0.96f, 0.96f, 0.97f, 1.f);
-    const ImVec4 border(0.88f, 0.88f, 0.90f, 1.f);
-    const ImVec4 textMain(0.13f, 0.13f, 0.15f, 1.f);
-    const ImVec4 textMuted(0.45f, 0.45f, 0.48f, 1.f);
 
-    c[ImGuiCol_Text] = textMain;
-    c[ImGuiCol_TextDisabled] = textMuted;
-    c[ImGuiCol_WindowBg] = bgPage;
-    c[ImGuiCol_ChildBg] = white;
-    c[ImGuiCol_PopupBg] = white;
-    c[ImGuiCol_Border] = border;
-    c[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0.04f);
-    c[ImGuiCol_FrameBg] = white;
-    c[ImGuiCol_FrameBgHovered] = ImVec4(0.97f, 0.97f, 0.98f, 1.f);
-    c[ImGuiCol_FrameBgActive] = ImVec4(0.94f, 0.95f, 0.97f, 1.f);
-    c[ImGuiCol_TitleBg] = white;
-    c[ImGuiCol_TitleBgActive] = white;
-    c[ImGuiCol_CheckMark] = ImVec4(0.15f, 0.55f, 0.95f, 1.f);
-    c[ImGuiCol_SliderGrab] = ImVec4(0.35f, 0.55f, 0.95f, 1.f);
-    c[ImGuiCol_Button] = ImVec4(0.93f, 0.93f, 0.94f, 1.f);
-    c[ImGuiCol_ButtonHovered] = ImVec4(0.88f, 0.88f, 0.90f, 1.f);
-    c[ImGuiCol_ButtonActive] = ImVec4(0.82f, 0.82f, 0.85f, 1.f);
-    c[ImGuiCol_Header] = ImVec4(0.94f, 0.95f, 0.97f, 1.f);
-    c[ImGuiCol_HeaderHovered] = ImVec4(0.90f, 0.92f, 0.96f, 1.f);
-    c[ImGuiCol_HeaderActive] = ImVec4(0.86f, 0.90f, 0.96f, 1.f);
-    c[ImGuiCol_Separator] = border;
-    // Tab：选中项用橙色高亮（与 Send 按钮一致），未选中为浅灰；悬停统一略提亮橙色，避免选中 Tab 悬停时变灰
-    const ImVec4 tabOrange(1.0f, 0.424f, 0.216f, 1.f);
-    const ImVec4 tabOrangeHover(1.0f, 0.52f, 0.32f, 1.f);
-    const ImVec4 tabOrangeUnfocused(0.98f, 0.50f, 0.30f, 1.f);
-    c[ImGuiCol_Tab] = ImVec4(0.93f, 0.93f, 0.94f, 1.f);
-    c[ImGuiCol_TabHovered] = tabOrangeHover;
-    c[ImGuiCol_TabSelected] = tabOrange;
-    c[ImGuiCol_TabSelectedOverline] = ImVec4(1.0f, 0.65f, 0.40f, 1.f);
-    c[ImGuiCol_TabDimmed] = ImVec4(0.94f, 0.94f, 0.95f, 1.f);
-    c[ImGuiCol_TabDimmedSelected] = tabOrangeUnfocused;
-    c[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(1.0f, 0.58f, 0.38f, 1.f);
-    c[ImGuiCol_TabActive] = tabOrange;
-    c[ImGuiCol_TabUnfocused] = ImVec4(0.94f, 0.94f, 0.95f, 1.f);
-    c[ImGuiCol_TabUnfocusedActive] = tabOrangeUnfocused;
-    c[ImGuiCol_ScrollbarBg] = ImVec4(0.96f, 0.96f, 0.97f, 1.f);
-    c[ImGuiCol_ScrollbarGrab] = ImVec4(0.75f, 0.75f, 0.78f, 1.f);
-    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.65f, 0.65f, 0.70f, 1.f);
-    c[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.55f, 0.55f, 0.60f, 1.f);
+    c[ImGuiCol_Text] = kOnSurface;
+    c[ImGuiCol_TextDisabled] = kOnSurfaceVariant;
+    c[ImGuiCol_WindowBg] = kSurfaceDim;
+    c[ImGuiCol_ChildBg] = kSurface;
+    c[ImGuiCol_PopupBg] = kSurface;
+    c[ImGuiCol_Border] = kOutline;
+    c[ImGuiCol_BorderShadow] = ImVec4(0.f, 0.f, 0.f, 0.06f);
+    c[ImGuiCol_FrameBg] = kSurface;
+    c[ImGuiCol_FrameBgHovered] = kPrimaryContainer;
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.78f, 0.86f, 0.98f, 1.f);
+    c[ImGuiCol_TitleBg] = kSurface;
+    c[ImGuiCol_TitleBgActive] = kSurface;
+    c[ImGuiCol_TitleBgCollapsed] = kSurfaceDim;
+    c[ImGuiCol_CheckMark] = kPrimary;
+    c[ImGuiCol_SliderGrab] = kPrimary;
+    c[ImGuiCol_SliderGrabActive] = kPrimaryActive;
+    c[ImGuiCol_Button] = kSurfaceVariant;
+    c[ImGuiCol_ButtonHovered] = ImVec4(0.91f, 0.92f, 0.94f, 1.f);
+    c[ImGuiCol_ButtonActive] = ImVec4(0.86f, 0.88f, 0.91f, 1.f);
+    c[ImGuiCol_Header] = kPrimaryContainer;
+    c[ImGuiCol_HeaderHovered] = ImVec4(0.76f, 0.86f, 0.98f, 1.f);
+    c[ImGuiCol_HeaderActive] = ImVec4(0.68f, 0.80f, 0.96f, 1.f);
+    c[ImGuiCol_Separator] = kOutline;
+    c[ImGuiCol_SeparatorHovered] = kPrimary;
+    c[ImGuiCol_SeparatorActive] = kPrimaryActive;
+    c[ImGuiCol_Tab] = ImVec4(0.f, 0.f, 0.f, 0.f);
+    c[ImGuiCol_TabHovered] = kPrimaryContainer;
+    c[ImGuiCol_TabSelected] = kSurface;
+    c[ImGuiCol_TabSelectedOverline] = kPrimary;
+    c[ImGuiCol_TabDimmed] = ImVec4(0.f, 0.f, 0.f, 0.f);
+    c[ImGuiCol_TabDimmedSelected] = kSurfaceVariant;
+    c[ImGuiCol_TabDimmedSelectedOverline] = kPrimary;
+    c[ImGuiCol_TabActive] = kSurface;
+    c[ImGuiCol_TabUnfocused] = ImVec4(0.f, 0.f, 0.f, 0.f);
+    c[ImGuiCol_TabUnfocusedActive] = kSurfaceVariant;
+    c[ImGuiCol_ScrollbarBg] = ImVec4(0.f, 0.f, 0.f, 0.f);
+    c[ImGuiCol_ScrollbarGrab] = ImVec4(0.70f, 0.73f, 0.76f, 0.55f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.55f, 0.60f, 0.65f, 0.72f);
+    c[ImGuiCol_ScrollbarGrabActive] = kPrimary;
+    c[ImGuiCol_TableHeaderBg] = kSurfaceVariant;
+    c[ImGuiCol_TableBorderStrong] = kOutline;
+    c[ImGuiCol_TableBorderLight] = ImVec4(0.91f, 0.92f, 0.94f, 1.f);
+    c[ImGuiCol_TableRowBg] = kSurface;
+    c[ImGuiCol_TableRowBgAlt] = kSurfaceDim;
 }
 
-void PushSendButtonStyle()
+void PushFilledButtonStyle()
 {
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.424f, 0.216f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.96f, 0.38f, 0.18f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.88f, 0.32f, 0.14f, 1.f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+    using namespace Material;
+    ImGui::PushStyleColor(ImGuiCol_Button, kPrimary);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kPrimaryHover);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, kPrimaryActive);
+    ImGui::PushStyleColor(ImGuiCol_Text, kOnPrimary);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 20.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(16.f, 8.f));
 }
 
-void PopSendButtonStyle()
+void PopFilledButtonStyle()
+{
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(4);
+}
+
+void PushTonalButtonStyle()
+{
+    using namespace Material;
+    ImGui::PushStyleColor(ImGuiCol_Button, kPrimaryContainer);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.76f, 0.86f, 0.98f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.68f, 0.80f, 0.96f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_Text, kPrimary);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 20.f);
+}
+
+void PopTonalButtonStyle()
 {
     ImGui::PopStyleVar();
-    ImGui::PopStyleColor(3);
+    ImGui::PopStyleColor(4);
+}
+
+void PushOutlinedButtonStyle()
+{
+    using namespace Material;
+    ImGui::PushStyleColor(ImGuiCol_Button, kSurface);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kPrimaryContainer);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.76f, 0.86f, 0.98f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_Text, kPrimary);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 20.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.f);
+}
+
+void PopOutlinedButtonStyle()
+{
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(4);
 }
 
 bool DrawRowOpButton(const char* labelWithId)
 {
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.93f, 0.93f, 0.94f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.85f, 0.86f, 0.88f, 1.f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.78f, 0.80f, 0.84f, 1.f));
+    using namespace Material;
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5.f, 2.f));
+    ImGui::PushStyleColor(ImGuiCol_Button, kSurfaceVariant);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kPrimaryContainer);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.68f, 0.80f, 0.96f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_Text, kPrimary);
     const bool clicked = ImGui::SmallButton(labelWithId);
-    ImGui::PopStyleColor(3);
-    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(2);
     return clicked;
 }
 
@@ -716,15 +804,16 @@ void DrawInlineSpinner(float radius, float thickness, ImU32 col)
 
 ImVec4 StatusLineColor(int httpCode)
 {
+    using namespace Material;
     if (httpCode <= 0)
-        return ImVec4(0.35f, 0.35f, 0.38f, 1.f);
+        return kOnSurfaceVariant;
     if (httpCode >= 200 && httpCode < 300)
-        return ImVec4(0.10f, 0.62f, 0.28f, 1.f);
+        return kSuccess;
     if (httpCode >= 300 && httpCode < 400)
-        return ImVec4(0.75f, 0.45f, 0.10f, 1.f);
+        return kWarning;
     if (httpCode >= 400)
-        return ImVec4(0.85f, 0.22f, 0.18f, 1.f);
-    return ImVec4(0.35f, 0.35f, 0.38f, 1.f);
+        return kError;
+    return kOnSurfaceVariant;
 }
 
 struct AsyncSlot {
@@ -794,6 +883,215 @@ void PushHistoryUnique(std::vector<RequestHistoryEntry>& hist, RequestHistoryEnt
         hist.resize(kMax);
 }
 
+constexpr char kHistFieldSep = '\x1f';
+constexpr char kHistRowSep = '\x1e';
+
+std::string SerializeQueryRows(const std::vector<std::tuple<bool, std::string, std::string, std::string>>& rows)
+{
+    std::string o;
+    for (const auto& t : rows) {
+        if (!o.empty())
+            o.push_back(kHistRowSep);
+        o.push_back(std::get<0>(t) ? '1' : '0');
+        o.push_back(kHistFieldSep);
+        o += std::get<1>(t);
+        o.push_back(kHistFieldSep);
+        o += std::get<2>(t);
+        o.push_back(kHistFieldSep);
+        o += std::get<3>(t);
+    }
+    return o;
+}
+
+void DeserializeQueryRows(const std::string& s,
+                          std::vector<std::tuple<bool, std::string, std::string, std::string>>& rows)
+{
+    rows.clear();
+    size_t pos = 0;
+    while (pos < s.size()) {
+        const size_t rowEnd = s.find(kHistRowSep, pos);
+        const std::string row = (rowEnd == std::string::npos) ? s.substr(pos) : s.substr(pos, rowEnd - pos);
+        pos = (rowEnd == std::string::npos) ? s.size() : rowEnd + 1;
+        if (row.empty())
+            continue;
+
+        std::vector<std::string> fields;
+        size_t fp = 0;
+        while (fp < row.size()) {
+            const size_t fe = row.find(kHistFieldSep, fp);
+            fields.push_back((fe == std::string::npos) ? row.substr(fp) : row.substr(fp, fe - fp));
+            if (fe == std::string::npos)
+                break;
+            fp = fe + 1;
+        }
+        if (fields.size() < 4)
+            continue;
+        rows.emplace_back(fields[0] != "0", fields[1], fields[2], fields[3]);
+    }
+    if (rows.empty())
+        rows.emplace_back(true, std::string(), std::string(), std::string());
+}
+
+std::string SerializeHeaderRows(const std::vector<std::pair<std::string, std::string>>& rows)
+{
+    std::string o;
+    for (const auto& p : rows) {
+        if (!o.empty())
+            o.push_back(kHistRowSep);
+        o += p.first;
+        o.push_back(kHistFieldSep);
+        o += p.second;
+    }
+    return o;
+}
+
+void DeserializeHeaderRows(const std::string& s, std::vector<std::pair<std::string, std::string>>& rows)
+{
+    rows.clear();
+    size_t pos = 0;
+    while (pos < s.size()) {
+        const size_t rowEnd = s.find(kHistRowSep, pos);
+        const std::string row = (rowEnd == std::string::npos) ? s.substr(pos) : s.substr(pos, rowEnd - pos);
+        pos = (rowEnd == std::string::npos) ? s.size() : rowEnd + 1;
+        if (row.empty())
+            continue;
+        const size_t sep = row.find(kHistFieldSep);
+        if (sep == std::string::npos)
+            rows.emplace_back(row, std::string());
+        else
+            rows.emplace_back(row.substr(0, sep), row.substr(sep + 1));
+    }
+    if (rows.empty())
+        rows.emplace_back(std::string(), std::string());
+}
+
+std::string SerializeFormRows(const std::vector<std::tuple<bool, std::string, std::string>>& rows)
+{
+    std::string o;
+    for (const auto& t : rows) {
+        if (!o.empty())
+            o.push_back(kHistRowSep);
+        o.push_back(std::get<0>(t) ? '1' : '0');
+        o.push_back(kHistFieldSep);
+        o += std::get<1>(t);
+        o.push_back(kHistFieldSep);
+        o += std::get<2>(t);
+    }
+    return o;
+}
+
+void DeserializeFormRows(const std::string& s, std::vector<std::tuple<bool, std::string, std::string>>& rows)
+{
+    rows.clear();
+    size_t pos = 0;
+    while (pos < s.size()) {
+        const size_t rowEnd = s.find(kHistRowSep, pos);
+        const std::string row = (rowEnd == std::string::npos) ? s.substr(pos) : s.substr(pos, rowEnd - pos);
+        pos = (rowEnd == std::string::npos) ? s.size() : rowEnd + 1;
+        if (row.empty())
+            continue;
+
+        std::vector<std::string> fields;
+        size_t fp = 0;
+        while (fp < row.size()) {
+            const size_t fe = row.find(kHistFieldSep, fp);
+            fields.push_back((fe == std::string::npos) ? row.substr(fp) : row.substr(fp, fe - fp));
+            if (fe == std::string::npos)
+                break;
+            fp = fe + 1;
+        }
+        if (fields.size() < 3)
+            continue;
+        rows.emplace_back(fields[0] != "0", fields[1], fields[2]);
+    }
+    if (rows.empty())
+        rows.emplace_back(true, std::string(), std::string());
+}
+
+void AppendPayloadField(std::string& payload, const char* key, const std::string& value)
+{
+    if (!payload.empty())
+        payload.push_back('&');
+    payload += key;
+    payload.push_back('=');
+    payload += UrlEncode(value);
+}
+
+std::string SerializeHistoryPayload(const RequestHistoryEntry& e)
+{
+    std::string payload;
+    AppendPayloadField(payload, "bodyMode", std::to_string(e.bodyMode));
+    AppendPayloadField(payload, "rawMode", std::to_string(e.rawContentTypeMode));
+    AppendPayloadField(payload, "body", e.reqBody);
+    AppendPayloadField(payload, "query", SerializeQueryRows(e.queryRows));
+    AppendPayloadField(payload, "headers", SerializeHeaderRows(e.headerRows));
+    AppendPayloadField(payload, "form", SerializeFormRows(e.formRows));
+    return payload;
+}
+
+void ApplyHistoryPayload(const std::string& payload, RequestHistoryEntry& e)
+{
+    size_t pos = 0;
+    while (pos < payload.size()) {
+        const size_t amp = payload.find('&', pos);
+        const std::string pair = (amp == std::string::npos) ? payload.substr(pos) : payload.substr(pos, amp - pos);
+        pos = (amp == std::string::npos) ? payload.size() : amp + 1;
+        const size_t eq = pair.find('=');
+        if (eq == std::string::npos)
+            continue;
+        const std::string key = pair.substr(0, eq);
+        const std::string value = PercentDecode(pair.substr(eq + 1));
+        if (key == "bodyMode")
+            e.bodyMode = std::stoi(value);
+        else if (key == "rawMode")
+            e.rawContentTypeMode = std::stoi(value);
+        else if (key == "body")
+            e.reqBody = value;
+        else if (key == "query")
+            DeserializeQueryRows(value, e.queryRows);
+        else if (key == "headers")
+            DeserializeHeaderRows(value, e.headerRows);
+        else if (key == "form")
+            DeserializeFormRows(value, e.formRows);
+    }
+}
+
+void WriteHistoryLogEntry(std::ostream& ofs, const RequestHistoryEntry& e)
+{
+    const int64_t ts = (e.createdAtMs > 0) ? e.createdAtMs : NowEpochMs();
+    ofs << "v2\t" << ts << '\t' << UrlEncode(ToUpper(e.method)) << '\t' << UrlEncode(e.url) << '\t'
+        << UrlEncode(SerializeHistoryPayload(e)) << '\n';
+}
+
+void AppendHistoryLogEntry(const RequestHistoryEntry& e)
+{
+    try {
+        const std::filesystem::path p = HistoryLogPath();
+        std::filesystem::create_directories(p.parent_path());
+        std::ofstream ofs(p, std::ios::app | std::ios::binary);
+        if (!ofs)
+            return;
+        WriteHistoryLogEntry(ofs, e);
+    } catch (...) {
+    }
+}
+
+std::vector<std::string> SplitHistoryLogLine(const std::string& line)
+{
+    std::vector<std::string> fields;
+    size_t pos = 0;
+    while (pos < line.size()) {
+        const size_t tab = line.find('\t', pos);
+        if (tab == std::string::npos) {
+            fields.push_back(line.substr(pos));
+            break;
+        }
+        fields.push_back(line.substr(pos, tab - pos));
+        pos = tab + 1;
+    }
+    return fields;
+}
+
 void LoadHistoryFromLog(std::vector<RequestHistoryEntry>& history)
 {
     try {
@@ -806,33 +1104,41 @@ void LoadHistoryFromLog(std::vector<RequestHistoryEntry>& history)
 
         std::string line;
         while (std::getline(ifs, line)) {
-            const size_t t1 = line.find('\t');
-            if (t1 == std::string::npos)
-                continue;
-            const size_t t2 = line.find('\t', t1 + 1);
-            if (t2 == std::string::npos)
+            if (line.empty())
                 continue;
 
-            const std::string tsRaw = line.substr(0, t1);
-            std::string method = PercentDecode(line.substr(t1 + 1, t2 - (t1 + 1)));
-            std::string fullUrl = PercentDecode(line.substr(t2 + 1));
-            method = ToUpper(TrimCopy(method));
-            fullUrl = TrimCopy(fullUrl);
-            if (method.empty() || !LooksLikeHttpUrlInput(fullUrl))
-                continue;
+            const std::vector<std::string> fields = SplitHistoryLogLine(line);
+            RequestHistoryEntry he;
 
-            int64_t createdAtMs = 0;
-            try {
-                createdAtMs = std::stoll(tsRaw);
-            } catch (...) {
-                createdAtMs = 0;
+            if (fields.size() >= 5 && fields[0] == "v2") {
+                try {
+                    he.createdAtMs = std::stoll(fields[1]);
+                } catch (...) {
+                    he.createdAtMs = 0;
+                }
+                he.method = ToUpper(TrimCopy(PercentDecode(fields[2])));
+                he.url = TrimCopy(PercentDecode(fields[3]));
+                ApplyHistoryPayload(PercentDecode(fields[4]), he);
+            } else if (fields.size() >= 3) {
+                try {
+                    he.createdAtMs = std::stoll(fields[0]);
+                } catch (...) {
+                    he.createdAtMs = 0;
+                }
+                he.method = ToUpper(TrimCopy(PercentDecode(fields[1])));
+                const std::string fullUrl = TrimCopy(PercentDecode(fields[2]));
+                SplitUrlAndQuery(fullUrl, he.url, he.queryRows);
+            } else {
+                continue;
             }
 
-            RequestHistoryEntry he;
-            he.method = method;
-            he.url = fullUrl; // 已含 query，展示时按完整 URL 使用
-            he.createdAtMs = createdAtMs;
-            he.fingerprint = RequestFingerprint(method, fullUrl, he.headerRows, "");
+            if (he.method.empty() || !LooksLikeHttpUrlInput(MergeUrlQuery(he.url, he.queryRows)))
+                continue;
+
+            const std::string fullUrl = MergeUrlQuery(he.url, he.queryRows);
+            const std::string bodyOut = (he.bodyMode == 1) ? he.reqBody
+                : (he.bodyMode == 2 ? BuildFormUrlEncoded(he.formRows) : std::string());
+            he.fingerprint = RequestFingerprint(he.method, fullUrl, he.headerRows, bodyOut);
             PushHistoryUnique(history, std::move(he));
         }
     } catch (...) {
@@ -849,13 +1155,8 @@ void RewriteHistoryLog(const std::vector<RequestHistoryEntry>& history)
         if (!ofs)
             return;
 
-        // 日志按时间从旧到新写入，保持可读性。
-        for (auto it = history.rbegin(); it != history.rend(); ++it) {
-            const RequestHistoryEntry& e = *it;
-            const int64_t ts = (e.createdAtMs > 0) ? e.createdAtMs : NowEpochMs();
-            const std::string fullUrl = MergeUrlQuery(e.url, e.queryRows);
-            ofs << ts << '\t' << UrlEncode(ToUpper(e.method)) << '\t' << UrlEncode(fullUrl) << '\n';
-        }
+        for (auto it = history.rbegin(); it != history.rend(); ++it)
+            WriteHistoryLogEntry(ofs, *it);
     } catch (...) {
         // 日志重写失败不影响主流程
     }
@@ -888,32 +1189,78 @@ int main()
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr;
 
-    ImFont* fontMono = nullptr;
+    // Segoe UI（Google 风格无衬线）+ 微软雅黑合并，保证中英文显示
+    ImFont* fontEditorUtf8 = nullptr;
+    ImFont* fontTitle = nullptr;
+    ImFont* fontCode = nullptr;
     {
         ImFontConfig cfg;
         cfg.OversampleH = 2;
         cfg.OversampleV = 2;
         const ImWchar* ranges = io.Fonts->GetGlyphRangesChineseFull();
-        ImFont* ui = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 17.0f, &cfg, ranges);
+        ImFont* ui = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f, &cfg,
+                                                  io.Fonts->GetGlyphRangesDefault());
         if (!ui)
-            ui = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\simhei.ttf", 17.0f, &cfg, ranges);
-        if (ui)
+            ui = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 19.0f, &cfg, ranges);
+        if (ui) {
+            ImFontConfig cfgMerge;
+            cfgMerge.MergeMode = true;
+            cfgMerge.OversampleH = 2;
+            cfgMerge.OversampleV = 2;
+            io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 19.0f, &cfgMerge, ranges);
             io.FontDefault = ui;
+        }
+        fontEditorUtf8 = io.FontDefault ? io.FontDefault : io.Fonts->Fonts[0];
 
-        ImFontConfig monoCfg;
-        monoCfg.OversampleH = 2;
-        monoCfg.OversampleV = 2;
-        fontMono = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", 15.0f, &monoCfg,
-                                                io.Fonts->GetGlyphRangesDefault());
-        if (!fontMono)
-            fontMono = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\cour.ttf", 15.0f, &monoCfg,
+        ImFontConfig cfgTitle;
+        cfgTitle.OversampleH = 2;
+        cfgTitle.OversampleV = 2;
+        fontTitle = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 26.0f, &cfgTitle,
+                                                 io.Fonts->GetGlyphRangesDefault());
+        if (!fontTitle)
+            fontTitle = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 26.0f, &cfgTitle,
+                                                     io.Fonts->GetGlyphRangesDefault());
+        if (fontTitle) {
+            ImFontConfig cfgTitleMerge;
+            cfgTitleMerge.MergeMode = true;
+            io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyhbd.ttc", 26.0f, &cfgTitleMerge, ranges);
+        }
+
+        ImFontConfig cfgCode;
+        cfgCode.OversampleH = 2;
+        cfgCode.OversampleV = 2;
+        constexpr float kCodeLatinPx = 15.0f;
+        constexpr float kCodeCjkPx = 17.0f;
+        fontCode = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", kCodeCjkPx, &cfgCode, ranges);
+        if (!fontCode)
+            fontCode = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\simhei.ttf", kCodeCjkPx, &cfgCode, ranges);
+        if (fontCode) {
+            ImFontConfig cfgCodeMerge;
+            cfgCodeMerge.MergeMode = true;
+            cfgCodeMerge.OversampleH = 2;
+            cfgCodeMerge.OversampleV = 2;
+            io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", kCodeLatinPx, &cfgCodeMerge,
+                                         io.Fonts->GetGlyphRangesDefault());
+        } else {
+            fontCode = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", kCodeLatinPx, &cfgCode,
                                                     io.Fonts->GetGlyphRangesDefault());
-        if (!fontMono)
-            fontMono = io.FontDefault;
+            if (!fontCode)
+                fontCode = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\cour.ttf", kCodeLatinPx, &cfgCode,
+                                                        io.Fonts->GetGlyphRangesDefault());
+            if (fontCode) {
+                ImFontConfig cfgCodeMerge;
+                cfgCodeMerge.MergeMode = true;
+                cfgCodeMerge.OversampleH = 2;
+                cfgCodeMerge.OversampleV = 2;
+                io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", kCodeCjkPx, &cfgCodeMerge, ranges);
+            }
+        }
+        if (!fontCode)
+            fontCode = fontEditorUtf8;
     }
 
     ImGui::StyleColorsLight();
-    ApplyPostmanLightStyle();
+    ApplyMaterialTheme();
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL2_Init();
@@ -957,6 +1304,7 @@ int main()
 
     std::vector<RequestHistoryEntry> requestHistory;
     LoadHistoryFromLog(requestHistory);
+    RewriteHistoryLog(requestHistory);
     int selectedHistoryIdx = -1;
 
     while (!glfwWindowShouldClose(window)) {
@@ -1015,29 +1363,45 @@ int main()
         ImGui::Begin("main", nullptr,
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 
-        const float menuBarH = 30.f;
-        ImGui::BeginChild("menu_bar", ImVec2(0, menuBarH), true, ImGuiWindowFlags_NoScrollbar);
+        const float menuBarH = 56.f;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, Material::kSurface);
+        ImGui::BeginChild("top_app_bar", ImVec2(0, menuBarH), false, ImGuiWindowFlags_NoScrollbar);
         {
             const float lineH = ImGui::GetFrameHeight();
             const float availY = ImGui::GetContentRegionAvail().y;
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::max(0.f, (availY - lineH) * 0.5f));
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextDisabled("Menu");
-            ImGui::SameLine(ImGui::GetWindowWidth() - 92.f);
-            if (ImGui::Button("Settings", ImVec2(80.f, 0.f)))
+            if (fontTitle)
+                ImGui::PushFont(fontTitle);
+            ImGui::PushStyleColor(ImGuiCol_Text, Material::kPrimary);
+            ImGui::TextUnformatted("Squirrel");
+            ImGui::PopStyleColor();
+            if (fontTitle)
+                ImGui::PopFont();
+            ImGui::SameLine(ImGui::GetWindowWidth() - 108.f);
+            PushTonalButtonStyle();
+            if (ImGui::Button("设置", ImVec2(88.f, 0.f)))
                 settingsPanelOpen = true;
+            PopTonalButtonStyle();
         }
         ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
 
-        const float sidebarW = 268.f;
-        const float mainH = ImGui::GetContentRegionAvail().y - 26.f;
+        const float sidebarW = 280.f;
+        const float mainH = ImGui::GetContentRegionAvail().y;
         ImGui::BeginChild("main_row", ImVec2(0, mainH), false);
 
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, Material::kSurface);
         ImGui::BeginChild("sidebar", ImVec2(sidebarW, 0), true);
-        ImGui::TextDisabled("请求历史");
+        ImGui::PushStyleColor(ImGuiCol_Text, Material::kOnSurface);
+        ImGui::TextUnformatted("请求历史");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
         static char historyFilterBuf[256] = "";
         ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##histfilter", "模糊搜索…（正则: re:pattern）", historyFilterBuf, sizeof(historyFilterBuf));
+        ImGui::InputTextWithHint("##histfilter", "搜索历史…（正则: re:pattern）", historyFilterBuf,
+                                 sizeof(historyFilterBuf));
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::BeginChild("hist_list", ImVec2(0, 0), false);
@@ -1110,17 +1474,17 @@ int main()
             const float textX = rowMin.x + 6.f;
 
             const std::string m = ToUpper(e.method);
-            ImVec4 mcol(0.15f, 0.15f, 0.18f, 1.f);
+            ImVec4 mcol = Material::kOnSurfaceVariant;
             if (m == "GET")
-                mcol = ImVec4(0.12f, 0.62f, 0.35f, 1.f);
+                mcol = Material::kSuccess;
             else if (m == "POST")
-                mcol = ImVec4(0.95f, 0.50f, 0.15f, 1.f);
+                mcol = Material::kWarning;
             else if (m == "PUT")
-                mcol = ImVec4(0.20f, 0.45f, 0.85f, 1.f);
+                mcol = Material::kPrimary;
             else if (m == "PATCH")
-                mcol = ImVec4(0.55f, 0.35f, 0.85f, 1.f);
+                mcol = ImVec4(0.576f, 0.204f, 0.902f, 1.f);
             else if (m == "DELETE")
-                mcol = ImVec4(0.90f, 0.25f, 0.22f, 1.f);
+                mcol = Material::kError;
 
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->AddText(ImVec2(textX, textY), ImGui::GetColorU32(mcol), m.c_str());
@@ -1141,18 +1505,22 @@ int main()
             ImGui::TextDisabled("无匹配记录");
         ImGui::EndChild();
         ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
 
-        ImGui::SameLine();
+        ImGui::SameLine(0.f, 12.f);
 
         const ImGuiWindowFlags workspaceChildFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, Material::kSurface);
         ImGui::BeginChild("workspace", ImVec2(0, 0), true, workspaceChildFlags);
 
         if (ImGui::BeginTabBar("reqwin_tabs", ImGuiTabBarFlags_DrawSelectedOverline)) {
             if (ImGui::BeginTabItem("HTTP 请求")) {
 
-        ImGui::BeginChild("url_row", ImVec2(0, 44), false);
+        ImGui::BeginChild("url_row", ImVec2(0, 52), false);
         ImGui::AlignTextToFramePadding();
-        ImGui::SetNextItemWidth(108);
+        ImGui::SetNextItemWidth(112);
         const char* methods[] = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"};
         int mi = 0;
         for (int i = 0; i < 7; ++i) {
@@ -1167,7 +1535,7 @@ int main()
         ImGui::SameLine();
         const float rightPanelW = inFlight.load() ? 350.f : 230.f;
         ImGui::SetNextItemWidth(std::max(120.f, ImGui::GetContentRegionAvail().x - rightPanelW));
-        ImGui::InputTextWithHint("##url", "Enter request URL", &url);
+        ImGui::InputTextWithHint("##url", "输入请求 URL", &url);
 
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
@@ -1180,7 +1548,7 @@ int main()
         requestTimeoutSec = std::clamp(requestTimeoutSec, 1, 600);
         ImGui::SameLine();
         if (inFlight.load()) {
-            DrawInlineSpinner(10.f, 3.f, IM_COL32(255, 110, 55, 255));
+            DrawInlineSpinner(10.f, 3.f, ImGui::GetColorU32(Material::kPrimary));
             ImGui::SameLine();
             ImGui::AlignTextToFramePadding();
             const double waited = ImGui::GetTime() - reqStartTime;
@@ -1188,14 +1556,16 @@ int main()
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("此处为本地已等待时间（界面实时刷新）。完成后响应区「耗时」为整次请求在客户端测得的往返时间。");
             ImGui::SameLine();
+            PushOutlinedButtonStyle();
             if (ImGui::Button("取消", ImVec2(72, 0)))
             {
                 statusLine = "取消中…";
                 HttpRequestCancel(&httpCancel);
             }
+            PopOutlinedButtonStyle();
         } else {
-            PushSendButtonStyle();
-            if (ImGui::Button("Send", ImVec2(96, 0)) && !inFlight.load()) {
+            PushFilledButtonStyle();
+            if (ImGui::Button("发送", ImVec2(96, 0)) && !inFlight.load()) {
                 const bool validUrl = LooksLikeHttpUrlInput(url);
                 if (!validUrl) {
                     statusLine = "错误";
@@ -1211,8 +1581,6 @@ int main()
                     inFlight = true;
                     statusLine = "请求中…";
                     timeLine.clear();
-                    respHdrText.clear();
-                    respBodyText.clear();
                     lastHttpCode = 0;
                     lastBodyBytes = 0;
 
@@ -1267,8 +1635,8 @@ int main()
                         he.reqBody = reqBody;
                         he.rawContentTypeMode = rawContentTypeMode;
                         he.formRows = formRows;
+                        AppendHistoryLogEntry(he);
                         PushHistoryUnique(requestHistory, std::move(he));
-                        AppendHistoryLogLine(createdAtMs, m, fullUrl);
                         selectedHistoryIdx = 0;
                     }
 
@@ -1283,7 +1651,7 @@ int main()
                     }).detach();
                 }
             }
-            PopSendButtonStyle();
+            PopFilledButtonStyle();
         }
         ImGui::EndChild();
 
@@ -1297,6 +1665,8 @@ int main()
         const float respBlockH = std::max(minPaneH, totalH - reqBlockH - splitterH);
 
         const ImGuiWindowFlags reqTabChildFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 10.f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, Material::kSurfaceDim);
         ImGui::BeginChild("req_tabs_region", ImVec2(0, reqBlockH), true, reqTabChildFlags);
         if (ImGui::BeginTabBar("rtabs", ImGuiTabBarFlags_DrawSelectedOverline)) {
             if (ImGui::BeginTabItem("Params")) {
@@ -1420,6 +1790,7 @@ int main()
                 if (bodyMode == 1) {
                     if (rawContentTypeMode == 0 || rawContentTypeMode == 2) {
                         const bool asJson = (rawContentTypeMode == 0);
+                        PushTonalButtonStyle();
                         if (ImGui::Button(asJson ? "格式化 JSON" : "格式化 XML")) {
                             std::string formatted;
                             std::string err;
@@ -1434,20 +1805,21 @@ int main()
                                 bodyFormatStatus = err.empty() ? "格式化失败" : err;
                             }
                         }
+                        PopTonalButtonStyle();
                         if (!bodyFormatStatus.empty()) {
                             ImGui::SameLine();
-                            ImGui::TextColored(bodyFormatOk
-                                                   ? ImVec4(0.12f, 0.62f, 0.30f, 1.f)
-                                                   : ImVec4(0.85f, 0.22f, 0.18f, 1.f),
+                            ImGui::TextColored(bodyFormatOk ? Material::kSuccess : Material::kError,
                                                "%s", bodyFormatStatus.c_str());
                         }
                     } else {
                         bodyFormatStatus.clear();
                     }
 
-                    ImGui::PushFont(fontMono);
-                    ImGui::InputTextMultiline("##body", &reqBody, ImVec2(-1, -40.f));
-                    ImGui::PopFont();
+                    if (rawContentTypeMode == 0) {
+                        JsonHighlight::DrawEditableJsonView("##body_json", reqBody, ImVec2(-1, -40.f), fontCode);
+                    } else {
+                        JsonHighlight::DrawEditablePlainView("##body_plain", reqBody, ImVec2(-1, -40.f), fontCode);
+                    }
                 } else if (bodyMode == 2) {
                     RowOp fOp = RowOp::None;
                     int fOpAt = -1;
@@ -1510,6 +1882,8 @@ int main()
             ImGui::EndTabBar();
         }
         ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
 
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.f);
         ImGui::InvisibleButton("req_resp_splitter", ImVec2(-1.f, splitterH));
@@ -1526,13 +1900,15 @@ int main()
             const ImVec2 a = ImGui::GetItemRectMin();
             const ImVec2 b = ImGui::GetItemRectMax();
             const ImU32 col = ImGui::GetColorU32(ImGui::IsItemActive()
-                                                     ? ImVec4(1.0f, 0.424f, 0.216f, 0.85f)
-                                                     : ImVec4(0.75f, 0.75f, 0.78f, 0.9f));
+                                                     ? Material::kPrimary
+                                                     : Material::kOutline);
             const float y = (a.y + b.y) * 0.5f;
             dl->AddLine(ImVec2(a.x + 8.f, y), ImVec2(b.x - 8.f, y), col, 2.0f);
         }
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 2.f);
 
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 10.f);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, Material::kSurfaceDim);
         ImGui::BeginChild("resp_region", ImVec2(0, respBlockH), true);
         ImGui::AlignTextToFramePadding();
         ImGui::TextColored(StatusLineColor(lastHttpCode), "%s", statusLine.c_str());
@@ -1541,6 +1917,10 @@ int main()
         ImGui::SameLine();
         if (lastBodyBytes > 0) {
             ImGui::TextDisabled("|  %zu B", lastBodyBytes);
+        }
+        if (!respBodyText.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("|  %d 行", JsonHighlight::CountLines(respBodyText));
         }
         if (!downloadLine.empty()) {
             ImGui::SameLine();
@@ -1551,23 +1931,25 @@ int main()
         ImGui::PushID("response_tabs");
         if (ImGui::BeginTabBar("resp_tabs_bar", ImGuiTabBarFlags_DrawSelectedOverline)) {
             if (ImGui::BeginTabItem("Body##resp_body")) {
-                ImGui::PushFont(fontMono);
-                ImGui::InputTextMultiline("multiline_body", &respBodyText, ImVec2(-1, -6),
-                                         ImGuiInputTextFlags_ReadOnly);
-                ImGui::PopFont();
+                if (JsonHighlight::LooksLikeJson(respBodyText)) {
+                    JsonHighlight::DrawEditableJsonView("##resp_json_view", respBodyText, ImVec2(-1, -6),
+                                                        fontCode);
+                } else {
+                    JsonHighlight::DrawEditablePlainView("##resp_plain_view", respBodyText, ImVec2(-1, -6),
+                                                           fontCode);
+                }
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Headers##resp_headers")) {
-                ImGui::PushFont(fontMono);
-                ImGui::InputTextMultiline("multiline_hdr", &respHdrText, ImVec2(-1, -6),
-                                         ImGuiInputTextFlags_ReadOnly);
-                ImGui::PopFont();
+                JsonHighlight::DrawEditablePlainView("##resp_hdr_view", respHdrText, ImVec2(-1, -6), fontCode);
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
         }
         ImGui::PopID();
         ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
 
                 ImGui::EndTabItem();
             }
@@ -1575,16 +1957,9 @@ int main()
         }
 
         ImGui::EndChild();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
 
-        ImGui::EndChild();
-
-        ImGui::BeginChild("bottombar", ImVec2(0, 22), true, ImGuiWindowFlags_NoScrollbar);
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextDisabled("Console");
-        ImGui::SameLine(120);
-        ImGui::TextDisabled("Terminal");
-        ImGui::SameLine(ImGui::GetWindowWidth() - 200);
-        ImGui::TextDisabled("HTTPS / WinHTTP");
         ImGui::EndChild();
 
         ImGui::End();
@@ -1602,7 +1977,8 @@ int main()
         }
 
         if (settingsPanelOpen) {
-            if (ImGui::Begin("Settings Panel", &settingsPanelOpen, ImGuiWindowFlags_NoCollapse)) {
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 16.f);
+            if (ImGui::Begin("设置", &settingsPanelOpen, ImGuiWindowFlags_NoCollapse)) {
                 settingsPanelStoredSize = ImGui::GetWindowSize();
                 ImGui::TextUnformatted("历史记录管理");
                 ImGui::Separator();
@@ -1610,6 +1986,7 @@ int main()
                 ImGui::SetNextItemWidth(180.f);
                 ImGui::Combo("清理范围", &historyCleanupRange, cleanupRanges, IM_ARRAYSIZE(cleanupRanges));
                 ImGui::SameLine();
+                PushTonalButtonStyle();
                 if (ImGui::Button("清理该时间之前历史")) {
                     int days = 30;
                     if (historyCleanupRange == 1)
@@ -1633,13 +2010,16 @@ int main()
                         selectedHistoryIdx = -1;
                     historyCleanupStatus = "已清理 " + std::to_string(removed) + " 条历史记录";
                 }
+                PopTonalButtonStyle();
                 ImGui::SameLine();
+                PushOutlinedButtonStyle();
                 if (ImGui::Button("清空全部历史")) {
                     requestHistory.clear();
                     selectedHistoryIdx = -1;
                     RewriteHistoryLog(requestHistory);
                     historyCleanupStatus = "历史记录已全部清空";
                 }
+                PopOutlinedButtonStyle();
 
                 if (!historyCleanupStatus.empty()) {
                     ImGui::Spacing();
@@ -1647,6 +2027,7 @@ int main()
                 }
             }
             ImGui::End();
+            ImGui::PopStyleVar();
         }
         settingsPanelWasOpen = settingsPanelOpen;
 
@@ -1654,7 +2035,7 @@ int main()
         const int display_w = static_cast<int>(io.DisplaySize.x);
         const int display_h = static_cast<int>(io.DisplaySize.y);
         glViewport(0, 0, display_w, display_h);
-        glClearColor(0.94f, 0.94f, 0.95f, 1.f);
+        glClearColor(0.973f, 0.976f, 0.980f, 1.f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
