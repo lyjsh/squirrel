@@ -9,6 +9,7 @@
 - Body 支持：
   - `raw`（JSON / Text / XML）
   - `x-www-form-urlencoded`
+  - `form-data`（文本字段 + 文件上传，POST/PUT）
 - JSON / XML 一键格式化
 - 请求取消、超时自定义（发送按钮旁可设置秒数）
 - 左侧历史记录（支持模糊搜索与 `re:` 正则匹配）

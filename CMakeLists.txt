@@ -110,6 +110,7 @@ endif()
 add_executable(squirrel
     src/main.cpp
     src/HttpWin.cpp
+    src/CookieJar.cpp
 )
 target_include_directories(squirrel PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -128,7 +129,7 @@ else()
     target_compile_definitions(squirrel PRIVATE APITOOL_HTTP_ONLY)
 endif()
 if(WIN32)
-    target_link_libraries(squirrel PRIVATE ws2_32 crypt32)
+    target_link_libraries(squirrel PRIVATE ws2_32 crypt32 comdlg32)
     set_target_properties(squirrel PROPERTIES WIN32_EXECUTABLE TRUE)
     target_compile_definitions(squirrel PRIVATE UNICODE _UNICODE)
 endif()

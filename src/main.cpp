@@ -1,4 +1,5 @@
 #include "HttpWin.h"
+#include "CookieJar.h"
 #include "JsonHighlight.h"
 
 #include "imgui.h"
@@ -27,6 +28,14 @@
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4996)
+#endif
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <commdlg.h>
 #endif
 
 namespace {
@@ -609,6 +618,156 @@ bool MethodAllowsBody(const std::string& m)
     return m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE" || m == "OPTIONS";
 }
 
+bool MethodAllowsMultipart(const std::string& m)
+{
+    return m == "POST" || m == "PUT";
+}
+
+#if defined(_WIN32)
+bool PickOpenFilePath(std::string& outPath)
+{
+    wchar_t fileBuf[MAX_PATH] = {};
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFile = fileBuf;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"All files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn))
+        return false;
+    const int bytes =
+        WideCharToMultiByte(CP_UTF8, 0, fileBuf, -1, nullptr, 0, nullptr, nullptr);
+    if (bytes <= 1)
+        return false;
+    outPath.resize(static_cast<size_t>(bytes - 1));
+    WideCharToMultiByte(CP_UTF8, 0, fileBuf, -1, outPath.data(), bytes, nullptr, nullptr);
+    return true;
+}
+#else
+bool PickOpenFilePath(std::string&)
+{
+    return false;
+}
+#endif
+
+std::string GuessMimeTypeFromPath(const std::string& path)
+{
+    size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos)
+        return "application/octet-stream";
+    std::string ext = ToLowerCopy(path.substr(dot + 1));
+    if (ext == "json")
+        return "application/json";
+    if (ext == "xml")
+        return "application/xml";
+    if (ext == "txt" || ext == "text")
+        return "text/plain";
+    if (ext == "html" || ext == "htm")
+        return "text/html";
+    if (ext == "png")
+        return "image/png";
+    if (ext == "jpg" || ext == "jpeg")
+        return "image/jpeg";
+    if (ext == "gif")
+        return "image/gif";
+    if (ext == "webp")
+        return "image/webp";
+    if (ext == "pdf")
+        return "application/pdf";
+    if (ext == "zip")
+        return "application/zip";
+    if (ext == "csv")
+        return "text/csv";
+    if (ext == "mp4")
+        return "video/mp4";
+    if (ext == "mp3")
+        return "audio/mpeg";
+    return "application/octet-stream";
+}
+
+bool ReadFileBinary(const std::filesystem::path& path, std::string& out, std::string& err)
+{
+    err.clear();
+    out.clear();
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        err = "文件不存在: " + path.string();
+        return false;
+    }
+    const auto sz = std::filesystem::file_size(path, ec);
+    if (ec) {
+        err = "无法读取文件大小";
+        return false;
+    }
+    constexpr std::uintmax_t kMaxBytes = 64ull * 1024ull * 1024ull;
+    if (sz > kMaxBytes) {
+        err = "文件超过 64MB 上限";
+        return false;
+    }
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+        err = "无法打开文件";
+        return false;
+    }
+    out.resize(static_cast<size_t>(sz));
+    if (sz > 0) {
+        ifs.read(out.data(), static_cast<std::streamsize>(sz));
+        if (!ifs.good()) {
+            err = "读取文件失败";
+            out.clear();
+            return false;
+        }
+    }
+    return true;
+}
+
+// kind: 0=text, 1=file — (enabled, kind, name, value/path, contentType)
+using MultipartRow = std::tuple<bool, int, std::string, std::string, std::string>;
+
+bool BuildMultipartParts(const std::vector<MultipartRow>& rows,
+                         std::vector<HttpMultipartPart>& out,
+                         std::string& err)
+{
+    out.clear();
+    err.clear();
+    for (size_t i = 0; i < rows.size(); ++i) {
+        if (!std::get<0>(rows[i]))
+            continue;
+        const int kind = std::get<1>(rows[i]);
+        const std::string& name = std::get<2>(rows[i]);
+        const std::string& value = std::get<3>(rows[i]);
+        const std::string& ctypeIn = std::get<4>(rows[i]);
+        if (name.empty()) {
+            err = "第 " + std::to_string(i + 1) + " 行：字段名不能为空";
+            return false;
+        }
+        HttpMultipartPart part;
+        part.name = name;
+        if (kind == 1) {
+            if (value.empty()) {
+                err = "第 " + std::to_string(i + 1) + " 行：请选择文件";
+                return false;
+            }
+            std::string bytes;
+            if (!ReadFileBinary(value, bytes, err))
+                return false;
+            part.content = std::move(bytes);
+            part.filename = std::filesystem::path(value).filename().string();
+            part.content_type = ctypeIn.empty() ? GuessMimeTypeFromPath(value) : ctypeIn;
+        } else {
+            part.content = value;
+            part.content_type = ctypeIn.empty() ? "text/plain" : ctypeIn;
+        }
+        out.push_back(std::move(part));
+    }
+    if (out.empty()) {
+        err = "请至少添加一个有效的 form-data 字段";
+        return false;
+    }
+    return true;
+}
+
 bool LooksLikeHttpUrlInput(const std::string& rawUrl)
 {
     const std::string u = TrimCopy(rawUrl);
@@ -869,6 +1028,7 @@ struct RequestHistoryEntry {
     std::string reqBody;
     int rawContentTypeMode = 0;
     std::vector<std::tuple<bool, std::string, std::string>> formRows;
+    std::vector<MultipartRow> multipartRows;
 };
 
 void PushHistoryUnique(std::vector<RequestHistoryEntry>& hist, RequestHistoryEntry e)
@@ -881,6 +1041,61 @@ void PushHistoryUnique(std::vector<RequestHistoryEntry>& hist, RequestHistoryEnt
     constexpr size_t kMax = 200;
     if (hist.size() > kMax)
         hist.resize(kMax);
+}
+
+bool HistoryEntryStrictMatch(const RequestHistoryEntry& e,
+                             const std::string& method,
+                             const std::string& url,
+                             const std::vector<std::tuple<bool, std::string, std::string, std::string>>& queryRows,
+                             const std::vector<std::pair<std::string, std::string>>& headerRows,
+                             int bodyMode,
+                             const std::string& reqBody,
+                             int rawContentTypeMode,
+                             const std::vector<std::tuple<bool, std::string, std::string>>& formRows,
+                             const std::vector<MultipartRow>& multipartRows)
+{
+    return ToUpper(e.method) == ToUpper(method) && e.url == url && e.queryRows == queryRows
+        && e.headerRows == headerRows && e.bodyMode == bodyMode && e.reqBody == reqBody
+        && e.rawContentTypeMode == rawContentTypeMode && e.formRows == formRows
+        && e.multipartRows == multipartRows;
+}
+
+int FindHistoryIndexForPanel(const std::vector<RequestHistoryEntry>& history,
+                             const std::string& method,
+                             const std::string& url,
+                             const std::vector<std::tuple<bool, std::string, std::string, std::string>>& queryRows,
+                             const std::vector<std::pair<std::string, std::string>>& headerRows,
+                             int bodyMode,
+                             const std::string& reqBody,
+                             int rawContentTypeMode,
+                             const std::vector<std::tuple<bool, std::string, std::string>>& formRows,
+                             const std::vector<MultipartRow>& multipartRows,
+                             int preferredIdx)
+{
+    const std::string curMethod = ToUpper(method);
+    const std::string curFullUrl = MergeUrlQuery(url, queryRows);
+
+    for (int i = 0; i < static_cast<int>(history.size()); ++i) {
+        if (HistoryEntryStrictMatch(history[static_cast<size_t>(i)], method, url, queryRows, headerRows,
+                                    bodyMode, reqBody, rawContentTypeMode, formRows, multipartRows)) {
+            return i;
+        }
+    }
+
+    if (preferredIdx >= 0 && preferredIdx < static_cast<int>(history.size())) {
+        const RequestHistoryEntry& preferred = history[static_cast<size_t>(preferredIdx)];
+        if (ToUpper(preferred.method) == curMethod
+            && MergeUrlQuery(preferred.url, preferred.queryRows) == curFullUrl) {
+            return preferredIdx;
+        }
+    }
+
+    for (int i = 0; i < static_cast<int>(history.size()); ++i) {
+        const RequestHistoryEntry& e = history[static_cast<size_t>(i)];
+        if (ToUpper(e.method) == curMethod && MergeUrlQuery(e.url, e.queryRows) == curFullUrl)
+            return i;
+    }
+    return -1;
 }
 
 constexpr char kHistFieldSep = '\x1f';
@@ -1008,6 +1223,68 @@ void DeserializeFormRows(const std::string& s, std::vector<std::tuple<bool, std:
         rows.emplace_back(true, std::string(), std::string());
 }
 
+std::string SerializeMultipartRows(const std::vector<MultipartRow>& rows)
+{
+    std::string o;
+    for (const auto& t : rows) {
+        if (!o.empty())
+            o.push_back(kHistRowSep);
+        o.push_back(std::get<0>(t) ? '1' : '0');
+        o.push_back(kHistFieldSep);
+        o += std::to_string(std::get<1>(t));
+        o.push_back(kHistFieldSep);
+        o += std::get<2>(t);
+        o.push_back(kHistFieldSep);
+        o += std::get<3>(t);
+        o.push_back(kHistFieldSep);
+        o += std::get<4>(t);
+    }
+    return o;
+}
+
+void DeserializeMultipartRows(const std::string& s, std::vector<MultipartRow>& rows)
+{
+    rows.clear();
+    size_t pos = 0;
+    while (pos < s.size()) {
+        const size_t rowEnd = s.find(kHistRowSep, pos);
+        const std::string row = (rowEnd == std::string::npos) ? s.substr(pos) : s.substr(pos, rowEnd - pos);
+        pos = (rowEnd == std::string::npos) ? s.size() : rowEnd + 1;
+        if (row.empty())
+            continue;
+        std::vector<std::string> fields;
+        size_t fp = 0;
+        while (fp < row.size()) {
+            const size_t fe = row.find(kHistFieldSep, fp);
+            fields.push_back((fe == std::string::npos) ? row.substr(fp) : row.substr(fp, fe - fp));
+            if (fe == std::string::npos)
+                break;
+            fp = fe + 1;
+        }
+        if (fields.size() < 5)
+            continue;
+        rows.emplace_back(fields[0] != "0", std::stoi(fields[1]), fields[2], fields[3], fields[4]);
+    }
+    if (rows.empty())
+        rows.emplace_back(true, 0, std::string(), std::string(), std::string());
+}
+
+std::string MultipartFingerprint(const std::vector<MultipartRow>& rows)
+{
+    std::string o;
+    for (const auto& t : rows) {
+        if (!std::get<0>(t))
+            continue;
+        o += std::to_string(std::get<1>(t));
+        o += ':';
+        o += std::get<2>(t);
+        o += '=';
+        o += std::get<3>(t);
+        o += ';';
+    }
+    return o;
+}
+
 void AppendPayloadField(std::string& payload, const char* key, const std::string& value)
 {
     if (!payload.empty())
@@ -1026,6 +1303,7 @@ std::string SerializeHistoryPayload(const RequestHistoryEntry& e)
     AppendPayloadField(payload, "query", SerializeQueryRows(e.queryRows));
     AppendPayloadField(payload, "headers", SerializeHeaderRows(e.headerRows));
     AppendPayloadField(payload, "form", SerializeFormRows(e.formRows));
+    AppendPayloadField(payload, "multipart", SerializeMultipartRows(e.multipartRows));
     return payload;
 }
 
@@ -1053,6 +1331,8 @@ void ApplyHistoryPayload(const std::string& payload, RequestHistoryEntry& e)
             DeserializeHeaderRows(value, e.headerRows);
         else if (key == "form")
             DeserializeFormRows(value, e.formRows);
+        else if (key == "multipart")
+            DeserializeMultipartRows(value, e.multipartRows);
     }
 }
 
@@ -1137,7 +1417,8 @@ void LoadHistoryFromLog(std::vector<RequestHistoryEntry>& history)
 
             const std::string fullUrl = MergeUrlQuery(he.url, he.queryRows);
             const std::string bodyOut = (he.bodyMode == 1) ? he.reqBody
-                : (he.bodyMode == 2 ? BuildFormUrlEncoded(he.formRows) : std::string());
+                : (he.bodyMode == 2 ? BuildFormUrlEncoded(he.formRows)
+                                    : (he.bodyMode == 3 ? MultipartFingerprint(he.multipartRows) : std::string()));
             he.fingerprint = RequestFingerprint(he.method, fullUrl, he.headerRows, bodyOut);
             PushHistoryUnique(history, std::move(he));
         }
@@ -1279,6 +1560,8 @@ int main()
     int rawContentTypeMode = 0;
     std::vector<std::tuple<bool, std::string, std::string>> formRows;
     formRows.emplace_back(true, std::string(), std::string());
+    std::vector<MultipartRow> multipartRows;
+    multipartRows.emplace_back(true, 0, std::string(), std::string(), std::string());
     int requestTimeoutSec = 15;
     std::string bodyFormatStatus;
     bool bodyFormatOk = true;
@@ -1291,7 +1574,16 @@ int main()
     float reqPaneRatio = 0.50f;
 
     std::string respBodyText;
+    std::string respBodyBeforeFormat;
+    std::string respFormatStatus;
+    bool respFormatOk = true;
     std::string respHdrText;
+    bool cookieShowAllDomains = true;
+    std::string cookieActionStatus;
+    std::string cookieDraftDomain;
+    std::string cookieDraftName;
+    std::string cookieDraftValue;
+    std::string cookieDraftPath = "/";
     std::string statusLine = "就绪";
     std::string timeLine;
     int lastHttpCode = 0;
@@ -1306,6 +1598,9 @@ int main()
     LoadHistoryFromLog(requestHistory);
     RewriteHistoryLog(requestHistory);
     int selectedHistoryIdx = -1;
+
+    CookieJar cookieJar;
+    cookieJar.LoadFromDisk();
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -1338,6 +1633,11 @@ int main()
                 } else {
                     respBodyText = r.responseBodyUtf8;
                 }
+                if (cookieJar.enabled) {
+                    cookieJar.IngestFromResponse(r.responseHeadersUtf8, r.requestUrlUtf8);
+                }
+                respBodyBeforeFormat.clear();
+                respFormatStatus.clear();
             } else {
                 lastHttpCode = 0;
                 lastBodyBytes = 0;
@@ -1350,6 +1650,8 @@ int main()
                 respHdrText.clear();
                 respBodyText = r.errorMessage;
                 downloadLine.clear();
+                respBodyBeforeFormat.clear();
+                respFormatStatus.clear();
             }
         }
 
@@ -1406,37 +1708,10 @@ int main()
         ImGui::Separator();
         ImGui::BeginChild("hist_list", ImVec2(0, 0), false);
         bool anyShown = false;
-        int highlightedHistoryIdx = -1;
-        {
-            // 高亮与当前面板数据一致的历史项（优先严格匹配，退化为方法+完整URL匹配）
-            const std::string curMethod = ToUpper(method);
-            const std::string curFullUrl = MergeUrlQuery(url, queryRows);
-            for (int i = 0; i < static_cast<int>(requestHistory.size()); ++i) {
-                const RequestHistoryEntry& e = requestHistory[static_cast<size_t>(i)];
-                if (ToUpper(e.method) == curMethod
-                    && e.url == url
-                    && e.queryRows == queryRows
-                    && e.headerRows == headerRows
-                    && e.bodyMode == bodyMode
-                    && e.reqBody == reqBody
-                    && e.rawContentTypeMode == rawContentTypeMode
-                    && e.formRows == formRows) {
-                    highlightedHistoryIdx = i;
-                    break;
-                }
-            }
-            if (highlightedHistoryIdx < 0) {
-                for (int i = 0; i < static_cast<int>(requestHistory.size()); ++i) {
-                    const RequestHistoryEntry& e = requestHistory[static_cast<size_t>(i)];
-                    if (ToUpper(e.method) == curMethod
-                        && MergeUrlQuery(e.url, e.queryRows) == curFullUrl) {
-                        highlightedHistoryIdx = i;
-                        break;
-                    }
-                }
-            }
-        }
-        selectedHistoryIdx = highlightedHistoryIdx;
+        bool historyClicked = false;
+        const int matchedHistoryIdx = FindHistoryIndexForPanel(
+            requestHistory, method, url, queryRows, headerRows, bodyMode, reqBody, rawContentTypeMode,
+            formRows, multipartRows, selectedHistoryIdx);
         for (int i = 0; i < static_cast<int>(requestHistory.size()); ++i) {
             const RequestHistoryEntry& e = requestHistory[static_cast<size_t>(i)];
             const std::string full = MergeUrlQuery(e.url, e.queryRows);
@@ -1452,6 +1727,7 @@ int main()
             const float rowW = std::max(1.f, ImGui::GetContentRegionAvail().x);
             if (ImGui::Selectable("##histrow", sel, 0, ImVec2(rowW, rowH))) {
                 selectedHistoryIdx = i;
+                historyClicked = true;
                 method = e.method;
                 url = e.url;
                 queryRows = e.queryRows;
@@ -1466,6 +1742,9 @@ int main()
                 formRows = e.formRows;
                 if (formRows.empty())
                     formRows.emplace_back(true, std::string(), std::string());
+                multipartRows = e.multipartRows;
+                if (multipartRows.empty())
+                    multipartRows.emplace_back(true, 0, std::string(), std::string(), std::string());
             }
 
             const ImVec2 rowMin = ImGui::GetItemRectMin();
@@ -1499,6 +1778,8 @@ int main()
                 ImGui::SetTooltip("%s", full.c_str());
             ImGui::PopID();
         }
+        if (!historyClicked)
+            selectedHistoryIdx = matchedHistoryIdx;
         if (requestHistory.empty())
             ImGui::TextDisabled("发送请求后将显示在此\n相同请求只保留一条");
         else if (!anyShown)
@@ -1575,15 +1856,9 @@ int main()
                     lastHttpCode = 0;
                     lastBodyBytes = 0;
                     downloadLine.clear();
+                    respBodyBeforeFormat.clear();
+                    respFormatStatus.clear();
                 } else {
-                    HttpCancelToken_reset(&httpCancel);
-                    reqStartTime = ImGui::GetTime();
-                    inFlight = true;
-                    statusLine = "请求中…";
-                    timeLine.clear();
-                    lastHttpCode = 0;
-                    lastBodyBytes = 0;
-
                     const std::string m = ToUpper(method);
                     std::string fullUrl = MergeUrlQuery(url, queryRows);
                     std::vector<HttpHeader> hdrs;
@@ -1594,12 +1869,39 @@ int main()
                     }
                     std::string bodyOut;
                     std::string bodyContentType;
+                    std::vector<HttpMultipartPart> multipartParts;
+                    std::string prepareErr;
+
                     if (bodyMode == 1 && MethodAllowsBody(m))
                         bodyOut = reqBody;
                     else if (bodyMode == 2 && MethodAllowsBody(m)) {
                         bodyOut = BuildFormUrlEncoded(formRows);
                         bodyContentType = "application/x-www-form-urlencoded";
+                    } else if (bodyMode == 3 && MethodAllowsBody(m)) {
+                        if (!MethodAllowsMultipart(m)) {
+                            prepareErr = "form-data 文件上传仅支持 POST / PUT 方法";
+                        } else if (!BuildMultipartParts(multipartRows, multipartParts, prepareErr)) {
+                        } else {
+                            bodyOut = MultipartFingerprint(multipartRows);
+                        }
                     }
+
+                    if (!prepareErr.empty()) {
+                        statusLine = "错误";
+                        timeLine.clear();
+                        respHdrText.clear();
+                        respBodyText = prepareErr;
+                        lastHttpCode = 0;
+                        lastBodyBytes = 0;
+                        downloadLine.clear();
+                    } else {
+                    HttpCancelToken_reset(&httpCancel);
+                    reqStartTime = ImGui::GetTime();
+                    inFlight = true;
+                    statusLine = "请求中…";
+                    timeLine.clear();
+                    lastHttpCode = 0;
+                    lastBodyBytes = 0;
 
                     if (bodyMode == 1 && MethodAllowsBody(m)) {
                         if (rawContentTypeMode == 0)
@@ -1622,6 +1924,10 @@ int main()
                             hdrs.emplace_back("Content-Type", bodyContentType);
                     }
 
+                    if (cookieJar.enabled) {
+                        cookieJar.ApplyCookieHeader(fullUrl, hdrs);
+                    }
+
                     {
                         const int64_t createdAtMs = NowEpochMs();
                         RequestHistoryEntry he;
@@ -1635,6 +1941,7 @@ int main()
                         he.reqBody = reqBody;
                         he.rawContentTypeMode = rawContentTypeMode;
                         he.formRows = formRows;
+                        he.multipartRows = multipartRows;
                         AppendHistoryLogEntry(he);
                         PushHistoryUnique(requestHistory, std::move(he));
                         selectedHistoryIdx = 0;
@@ -1643,12 +1950,15 @@ int main()
                     AsyncSlot* slot = &async;
                     HttpCancelToken* pcancel = &httpCancel;
                     const int timeoutSec = requestTimeoutSec;
-                    std::thread([slot, m, fullUrl, hdrs, bodyOut, pcancel, timeoutSec]() {
-                        HttpResult r = HttpRequestSync(m, fullUrl, hdrs, bodyOut, pcancel, timeoutSec);
+                    std::thread([slot, m, fullUrl, hdrs, bodyOut, multipartParts, pcancel, timeoutSec]() {
+                        const std::vector<HttpMultipartPart>* ptr =
+                            multipartParts.empty() ? nullptr : &multipartParts;
+                        HttpResult r = HttpRequestSync(m, fullUrl, hdrs, bodyOut, pcancel, timeoutSec, ptr);
                         std::lock_guard<std::mutex> lock(slot->mtx);
                         slot->result = std::move(r);
                         slot->finished = true;
                     }).detach();
+                    }
                 }
             }
             PopFilledButtonStyle();
@@ -1772,12 +2082,179 @@ int main()
                 }
                 ImGui::EndTabItem();
             }
+            if (ImGui::BeginTabItem("Cookies")) {
+                ImGui::Checkbox("自动管理 Cookie", &cookieJar.enabled);
+                ImGui::SameLine();
+                ImGui::Checkbox("显示全部域名", &cookieShowAllDomains);
+
+                bool httpsDummy = false;
+                std::string currentHost;
+                std::string currentPathDummy;
+                CookieJar::ExtractUrlParts(MergeUrlQuery(url, queryRows), httpsDummy, currentHost, currentPathDummy);
+
+                ImGui::Spacing();
+                PushTonalButtonStyle();
+                if (ImGui::Button("清理过期")) {
+                    cookieJar.RemoveExpired();
+                    cookieActionStatus = "已清理过期 Cookie";
+                }
+                PopTonalButtonStyle();
+                ImGui::SameLine();
+                PushOutlinedButtonStyle();
+                if (ImGui::Button("清空当前域名")) {
+                    if (currentHost.empty()) {
+                        cookieActionStatus = "请先填写有效 URL";
+                    } else {
+                        cookieJar.ClearDomain(currentHost);
+                        cookieActionStatus = "已清空 " + currentHost + " 的 Cookie";
+                    }
+                }
+                PopOutlinedButtonStyle();
+                ImGui::SameLine();
+                PushOutlinedButtonStyle();
+                if (ImGui::Button("清空全部")) {
+                    cookieJar.ClearAll();
+                    cookieActionStatus = "Cookie 已全部清空";
+                }
+                PopOutlinedButtonStyle();
+                if (!cookieActionStatus.empty()) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", cookieActionStatus.c_str());
+                }
+
+                constexpr float kManualPanelMinH = 104.f;
+                const float remainingH = ImGui::GetContentRegionAvail().y;
+                const float tableH = std::max(64.f, remainingH - kManualPanelMinH);
+
+                int cookieDeleteAt = -1;
+                const std::string previewUrl = MergeUrlQuery(url, queryRows);
+                const std::vector<size_t> visibleCookies =
+                    cookieJar.VisibleIndices(previewUrl, cookieShowAllDomains);
+
+                ImGui::BeginChild("cookie_table_region", ImVec2(0, tableH), true);
+                if (ImGui::BeginTable("cookie_tbl", 7,
+                                      ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersOuterH
+                                          | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable
+                                          | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY)) {
+                    ImGui::TableSetupColumn("Domain", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.9f);
+                    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+                    ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthFixed, 80.f);
+                    ImGui::TableSetupColumn("Expires", ImGuiTableColumnFlags_WidthFixed, 136.f);
+                    ImGui::TableSetupColumn("Secure", ImGuiTableColumnFlags_WidthFixed, 56.f);
+                    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 40.f);
+                    ImGui::TableSetupScrollFreeze(0, 1);
+                    ImGui::TableHeadersRow();
+                    if (visibleCookies.empty()) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        if (cookieJar.cookies().empty()) {
+                            ImGui::TextDisabled("暂无 Cookie");
+                        } else {
+                            ImGui::TextDisabled("当前 URL 无匹配 Cookie，可勾选「显示全部域名」");
+                        }
+                    }
+                    for (size_t vi = 0; vi < visibleCookies.size(); ++vi) {
+                        const size_t idx = visibleCookies[vi];
+                        const HttpCookie& c = cookieJar.cookies()[idx];
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(c.domain.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextUnformatted(c.name.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::TextUnformatted(c.value.c_str());
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextUnformatted(c.path.c_str());
+                        ImGui::TableSetColumnIndex(4);
+                        ImGui::TextUnformatted(CookieJar::FormatExpiry(c).c_str());
+                        ImGui::TableSetColumnIndex(5);
+                        ImGui::TextUnformatted(c.secure ? "Yes" : "No");
+                        ImGui::TableSetColumnIndex(6);
+                        if (ImGui::SmallButton(("X##cd" + std::to_string(idx)).c_str()))
+                            cookieDeleteAt = static_cast<int>(idx);
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::EndChild();
+
+                if (cookieDeleteAt >= 0) {
+                    cookieJar.RemoveAt(static_cast<size_t>(cookieDeleteAt));
+                    cookieActionStatus = "已删除 Cookie";
+                }
+
+                ImGui::BeginChild("cookie_manual_region", ImVec2(0, 0), true);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextDisabled("手动添加");
+
+                const float fieldSpacing = ImGui::GetStyle().ItemInnerSpacing.x;
+                const float addBtnW = 88.f;
+                const float rowAvail = ImGui::GetContentRegionAvail().x;
+                const float domainW = std::max(100.f, rowAvail * 0.22f);
+                const float nameW = std::max(80.f, rowAvail * 0.16f);
+                const float pathW = 80.f;
+                const float valueW =
+                    std::max(80.f, rowAvail - domainW - nameW - pathW - addBtnW - fieldSpacing * 4.f);
+
+                ImGui::SetNextItemWidth(domainW);
+                ImGui::InputTextWithHint("##ckdom", "Domain（留空用当前域名）", &cookieDraftDomain);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(nameW);
+                ImGui::InputTextWithHint("##ckname", "Name *", &cookieDraftName);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(valueW);
+                ImGui::InputTextWithHint("##ckval", "Value", &cookieDraftValue);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(pathW);
+                ImGui::InputTextWithHint("##ckpath", "Path", &cookieDraftPath);
+                ImGui::SameLine();
+                PushTonalButtonStyle();
+                const bool addClicked = ImGui::Button("添加", ImVec2(addBtnW, 0));
+                PopTonalButtonStyle();
+
+                auto tryAddCookie = [&]() {
+                    std::string domain = TrimCopy(cookieDraftDomain);
+                    if (domain.empty())
+                        domain = currentHost;
+                    if (domain.empty()) {
+                        cookieActionStatus = "请填写 Domain，或在上方 URL 中填写域名";
+                        return;
+                    }
+                    const std::string name = TrimCopy(cookieDraftName);
+                    if (name.empty()) {
+                        cookieActionStatus = "请填写 Name";
+                        return;
+                    }
+                    HttpCookie c;
+                    c.domain = domain;
+                    c.name = name;
+                    c.value = cookieDraftValue;
+                    c.path = TrimCopy(cookieDraftPath).empty() ? "/" : TrimCopy(cookieDraftPath);
+                    cookieJar.Upsert(std::move(c));
+                    cookieDraftName.clear();
+                    cookieDraftValue.clear();
+                    cookieActionStatus = "Cookie 已添加（共 " + std::to_string(cookieJar.cookies().size()) + " 条）";
+                };
+
+                if (addClicked)
+                    tryAddCookie();
+
+                if (!cookieActionStatus.empty()) {
+                    ImGui::TextColored(cookieActionStatus.rfind("已添加", 0) == 0 ? Material::kSuccess
+                                                                                   : Material::kError,
+                                       "%s", cookieActionStatus.c_str());
+                } else {
+                    ImGui::TextDisabled("响应 Set-Cookie 会自动写入；Headers 中手动设置 Cookie 头时不会自动覆盖。");
+                }
+                ImGui::EndChild();
+                ImGui::EndTabItem();
+            }
             if (ImGui::BeginTabItem("Body##req_body")) {
                 const bool allow = MethodAllowsBody(ToUpper(method));
                 ImGui::BeginDisabled(!allow);
-                const char* bitems[] = {"无", "raw", "x-www-form-urlencoded"};
-                ImGui::SetNextItemWidth(180.f);
-                ImGui::Combo("##bodykind", &bodyMode, bitems, IM_ARRAYSIZE(bitems));
+                const char* bitems[] = {"无", "raw", "x-www-form-urlencoded", "form-data（文件上传）"};
+                ImGui::SetNextItemWidth(260.f);
+                ImGui::Combo("Body 类型", &bodyMode, bitems, IM_ARRAYSIZE(bitems));
                 if (bodyMode == 1) {
                     ImGui::SameLine();
                     ImGui::TextDisabled("Content-Type");
@@ -1868,6 +2345,94 @@ int main()
                             formRows[0] = std::make_tuple(true, std::string(), std::string());
                     }
                     ImGui::TextDisabled("发送时将自动编码并补充 Content-Type: application/x-www-form-urlencoded");
+                } else if (bodyMode == 3) {
+                    ImGui::TextDisabled("multipart/form-data：可混用文本字段与文件字段");
+                    if (!MethodAllowsMultipart(ToUpper(method))) {
+                        ImGui::TextColored(Material::kWarning, "form-data 文件上传仅支持 POST / PUT");
+                    }
+                    RowOp mpOp = RowOp::None;
+                    int mpOpAt = -1;
+                    int mpPickFileAt = -1;
+                    if (ImGui::BeginTable("mp_body_tbl", 6,
+                                          ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg
+                                              | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY,
+                                          ImVec2(0, -28.f))) {
+                        ImGui::TableSetupColumn("启用", ImGuiTableColumnFlags_WidthFixed, 48.f);
+                        ImGui::TableSetupColumn("类型", ImGuiTableColumnFlags_WidthFixed, 88.f);
+                        ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn("Value / 文件", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn("Content-Type", ImGuiTableColumnFlags_WidthStretch, 0.8f);
+                        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 56.f);
+                        ImGui::TableSetupScrollFreeze(0, 1);
+                        ImGui::TableHeadersRow();
+                        for (size_t i = 0; i < multipartRows.size(); ++i) {
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            bool on = std::get<0>(multipartRows[i]);
+                            ImGui::Checkbox(("##mpon" + std::to_string(i)).c_str(), &on);
+                            std::get<0>(multipartRows[i]) = on;
+                            ImGui::TableSetColumnIndex(1);
+                            int kind = std::get<1>(multipartRows[i]);
+                            const char* kindItems[] = {"文本", "文件"};
+                            ImGui::SetNextItemWidth(-1);
+                            ImGui::Combo(("##mpkind" + std::to_string(i)).c_str(), &kind, kindItems,
+                                         IM_ARRAYSIZE(kindItems));
+                            std::get<1>(multipartRows[i]) = kind;
+                            ImGui::TableSetColumnIndex(2);
+                            const float btnW = 22.f;
+                            const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+                            ImGui::PushItemWidth(std::max(40.f, ImGui::GetContentRegionAvail().x
+                                                               - (btnW * 2.f + spacing * 2.f)));
+                            ImGui::InputText(("##mpk" + std::to_string(i)).c_str(), &std::get<2>(multipartRows[i]));
+                            ImGui::PopItemWidth();
+                            ImGui::SameLine();
+                            if (DrawRowOpButton(("+##mpadd" + std::to_string(i)).c_str())) {
+                                mpOp = RowOp::Add;
+                                mpOpAt = static_cast<int>(i);
+                            }
+                            ImGui::SameLine();
+                            if (DrawRowOpButton(("-##mpdel" + std::to_string(i)).c_str())) {
+                                mpOp = RowOp::Del;
+                                mpOpAt = static_cast<int>(i);
+                            }
+                            ImGui::TableSetColumnIndex(3);
+                            ImGui::PushItemWidth(-1);
+                            if (kind == 1) {
+                                ImGui::InputTextWithHint(("##mpv" + std::to_string(i)).c_str(), "文件路径",
+                                                         &std::get<3>(multipartRows[i]));
+                            } else {
+                                ImGui::InputText(("##mpv" + std::to_string(i)).c_str(), &std::get<3>(multipartRows[i]));
+                            }
+                            ImGui::PopItemWidth();
+                            ImGui::TableSetColumnIndex(4);
+                            ImGui::PushItemWidth(-1);
+                            ImGui::InputTextWithHint(("##mpct" + std::to_string(i)).c_str(),
+                                                     kind == 1 ? "留空自动推断" : "可选", &std::get<4>(multipartRows[i]));
+                            ImGui::PopItemWidth();
+                            ImGui::TableSetColumnIndex(5);
+                            if (kind == 1) {
+                                if (ImGui::SmallButton(("选文件##mpf" + std::to_string(i)).c_str()))
+                                    mpPickFileAt = static_cast<int>(i);
+                            }
+                        }
+                        ImGui::EndTable();
+                    }
+                    if (mpOp == RowOp::Add && mpOpAt >= 0) {
+                        multipartRows.insert(multipartRows.begin() + (mpOpAt + 1),
+                                             MultipartRow{true, 0, std::string(), std::string(), std::string()});
+                    }
+                    if (mpOp == RowOp::Del && mpOpAt >= 0) {
+                        if (multipartRows.size() > 1)
+                            multipartRows.erase(multipartRows.begin() + mpOpAt);
+                        else
+                            multipartRows[0] = MultipartRow{true, 0, std::string(), std::string(), std::string()};
+                    }
+                    if (mpPickFileAt >= 0 && mpPickFileAt < static_cast<int>(multipartRows.size())) {
+                        std::string picked;
+                        if (PickOpenFilePath(picked))
+                            std::get<3>(multipartRows[static_cast<size_t>(mpPickFileAt)]) = picked;
+                    }
+                    ImGui::TextDisabled("发送为 multipart/form-data；单文件最大 64MB。");
                 }
                 ImGui::EndDisabled();
                 ImGui::EndDisabled();
@@ -1931,17 +2496,60 @@ int main()
         ImGui::PushID("response_tabs");
         if (ImGui::BeginTabBar("resp_tabs_bar", ImGuiTabBarFlags_DrawSelectedOverline)) {
             if (ImGui::BeginTabItem("Body##resp_body")) {
-                if (JsonHighlight::LooksLikeJson(respBodyText)) {
-                    JsonHighlight::DrawEditableJsonView("##resp_json_view", respBodyText, ImVec2(-1, -6),
-                                                        fontCode);
+                const bool respAsJson = JsonHighlight::LooksLikeJson(respBodyText);
+                const bool respAsXml = !respAsJson && JsonHighlight::LooksLikeXml(respBodyText);
+                const bool showRespFormatBar = respAsJson || respAsXml;
+                if (showRespFormatBar) {
+                    PushTonalButtonStyle();
+                    if (ImGui::Button(respAsJson ? "格式化 JSON" : "格式化 XML")) {
+                        std::string formatted;
+                        std::string err;
+                        const bool ok = respAsJson
+                            ? PrettyFormatJson(respBodyText, formatted, err)
+                            : PrettyFormatXml(respBodyText, formatted, err);
+                        respFormatOk = ok;
+                        if (ok) {
+                            if (respBodyBeforeFormat.empty())
+                                respBodyBeforeFormat = respBodyText;
+                            respBodyText = formatted;
+                            respFormatStatus = respAsJson ? "JSON 格式化完成" : "XML 格式化完成";
+                        } else {
+                            respFormatStatus = err.empty() ? "格式化失败" : err;
+                        }
+                    }
+                    PopTonalButtonStyle();
+                    if (!respBodyBeforeFormat.empty()) {
+                        ImGui::SameLine();
+                        PushTonalButtonStyle();
+                        if (ImGui::Button("恢复原始")) {
+                            respBodyText = respBodyBeforeFormat;
+                            respBodyBeforeFormat.clear();
+                            respFormatOk = true;
+                            respFormatStatus = "已恢复原始内容";
+                        }
+                        PopTonalButtonStyle();
+                    }
+                    if (!respFormatStatus.empty()) {
+                        ImGui::SameLine();
+                        ImGui::TextColored(respFormatOk ? Material::kSuccess : Material::kError, "%s",
+                                           respFormatStatus.c_str());
+                    }
                 } else {
-                    JsonHighlight::DrawEditablePlainView("##resp_plain_view", respBodyText, ImVec2(-1, -6),
-                                                           fontCode);
+                    respFormatStatus.clear();
+                }
+
+                const float respViewBottom = showRespFormatBar ? -40.f : -6.f;
+                if (respAsJson) {
+                    JsonHighlight::DrawSelectableJsonView("##resp_json_view", respBodyText,
+                                                          ImVec2(-1, respViewBottom), fontCode);
+                } else {
+                    JsonHighlight::DrawSelectablePlainView("##resp_plain_view", respBodyText,
+                                                           ImVec2(-1, respViewBottom), fontCode);
                 }
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Headers##resp_headers")) {
-                JsonHighlight::DrawEditablePlainView("##resp_hdr_view", respHdrText, ImVec2(-1, -6), fontCode);
+                JsonHighlight::DrawSelectablePlainView("##resp_hdr_view", respHdrText, ImVec2(-1, -6), fontCode);
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -2025,6 +2633,17 @@ int main()
                     ImGui::Spacing();
                     ImGui::TextDisabled("%s", historyCleanupStatus.c_str());
                 }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::TextUnformatted("Cookie 管理");
+                ImGui::TextDisabled("共 %zu 条 Cookie", cookieJar.cookies().size());
+                PushOutlinedButtonStyle();
+                if (ImGui::Button("清空全部 Cookie")) {
+                    cookieJar.ClearAll();
+                    cookieActionStatus = "Cookie 已全部清空";
+                }
+                PopOutlinedButtonStyle();
             }
             ImGui::End();
             ImGui::PopStyleVar();

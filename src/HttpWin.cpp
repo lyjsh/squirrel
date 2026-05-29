@@ -7,6 +7,7 @@
 #include <cctype>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #if defined(_MSC_VER)
 #pragma comment(lib, "crypt32.lib")
@@ -96,6 +97,53 @@ void MergeUserHeaders(httplib::Headers& out, const std::vector<HttpHeader>& head
     }
 }
 
+void StripContentTypeHeader(httplib::Headers& hdrs)
+{
+    for (auto it = hdrs.begin(); it != hdrs.end();) {
+        std::string lower = it->first;
+        for (char& c : lower)
+            c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        if (lower == "content-type")
+            it = hdrs.erase(it);
+        else
+            ++it;
+    }
+}
+
+httplib::MultipartFormDataItems ToHttplibMultipart(const std::vector<HttpMultipartPart>& parts)
+{
+    httplib::MultipartFormDataItems items;
+    items.reserve(parts.size());
+    for (const HttpMultipartPart& p : parts) {
+        httplib::MultipartFormData item;
+        item.name = p.name;
+        item.content = p.content;
+        item.filename = p.filename;
+        item.content_type = p.content_type;
+        items.push_back(std::move(item));
+    }
+    return items;
+}
+
+bool DispatchMultipart(httplib::Client& cli,
+                       const std::string& meth,
+                       const std::string& path,
+                       httplib::Headers& hdrs,
+                       const httplib::MultipartFormDataItems& items,
+                       httplib::Result& res)
+{
+    StripContentTypeHeader(hdrs);
+    if (meth == "POST") {
+        res = cli.Post(path, hdrs, items);
+        return true;
+    }
+    if (meth == "PUT") {
+        res = cli.Put(path, hdrs, items);
+        return true;
+    }
+    return false;
+}
+
 std::string HeadersToRawString(const httplib::Headers& hdrs)
 {
     std::ostringstream oss;
@@ -168,7 +216,8 @@ HttpResult HttpRequestSync(const std::string& method,
                            const std::vector<HttpHeader>& headers,
                            const std::string& bodyUtf8,
                            HttpCancelToken* cancel,
-                           int timeoutSeconds)
+                           int timeoutSeconds,
+                           const std::vector<HttpMultipartPart>* multipartParts)
 {
     HttpResult out;
     const auto t0 = std::chrono::steady_clock::now();
@@ -227,8 +276,10 @@ HttpResult HttpRequestSync(const std::string& method,
     bool hasContentType = false;
     MergeUserHeaders(hdrs, headers, hasContentType);
 
-    const bool sendBody = !bodyUtf8.empty()
-        && (meth == "POST" || meth == "PUT" || meth == "PATCH" || meth == "DELETE" || meth == "OPTIONS");
+    const bool useMultipart = multipartParts && !multipartParts->empty();
+    const bool sendBody = useMultipart
+        || (!bodyUtf8.empty()
+            && (meth == "POST" || meth == "PUT" || meth == "PATCH" || meth == "DELETE" || meth == "OPTIONS"));
 
     std::string contentTypeVal = "application/json; charset=utf-8";
     if (hasContentType) {
@@ -251,7 +302,13 @@ HttpResult HttpRequestSync(const std::string& method,
         return out;
     }
 
-    if (meth == "GET")
+    if (useMultipart) {
+        const httplib::MultipartFormDataItems items = ToHttplibMultipart(*multipartParts);
+        if (!DispatchMultipart(cli, meth, path, hdrs, items, res)) {
+            out.errorMessage = ErrMsg("multipart/form-data 仅支持 POST / PUT 方法");
+            return out;
+        }
+    } else if (meth == "GET")
         res = cli.Get(path, hdrs);
     else if (meth == "HEAD")
         res = cli.Head(path, hdrs);

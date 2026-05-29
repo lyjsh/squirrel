@@ -47,6 +47,14 @@ inline bool LooksLikeJson(std::string_view text)
     return t.front() == '{' || t.front() == '[';
 }
 
+inline bool LooksLikeXml(std::string_view text)
+{
+    const std::string_view t = TrimView(text);
+    if (t.empty())
+        return false;
+    return t.front() == '<';
+}
+
 inline int CountLines(std::string_view text)
 {
     if (text.empty())
@@ -494,7 +502,7 @@ inline void DrawHighlightedLines(ImDrawList* dl, ImFont* font, float fontSize, f
 }
 
 inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2& viewSize, ImFont* font,
-                                 bool jsonHighlight)
+                                 bool jsonHighlight, bool readOnly = false)
 {
     static thread_local std::vector<Span> spans;
     static thread_local std::vector<std::string_view> lines;
@@ -546,7 +554,9 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
     const ImGuiID selStartId = ImGui::GetID("##dblsel_start");
     const ImGuiID selEndId = ImGui::GetID("##dblsel_end");
     EditSelectionCallbackState selCallbackState{storage, selStartId, selEndId};
-    const ImGuiInputTextFlags inputFlags = ImGuiInputTextFlags_CallbackAlways;
+    ImGuiInputTextFlags inputFlags = ImGuiInputTextFlags_CallbackAlways;
+    if (readOnly)
+        inputFlags |= ImGuiInputTextFlags_ReadOnly;
     const ImVec2& mousePos = ImGui::GetIO().MousePos;
 
     auto drawEditorInput = [&]() {
@@ -565,24 +575,33 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
         ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.f, 0.f, 0.f, 0.f));
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.f, 0.f, 0.f, 0.f));
 
-        dl->ChannelsSplit(2);
-        dl->ChannelsSetCurrent(1);
-        drawEditorInput();
+        if (readOnly) {
+            BuildHighlightSpans(text, spans);
+            dl->PushClipRect(clipMin, clipMax, true);
+            DrawHighlightedLines(dl, font, fontSize, lineSpacing, origin, lineNumColW, codeX0, padY, contentSize.y,
+                                 maxDigits, lineCount, lines, lineStarts, spans, true);
+            dl->PopClipRect();
+            drawEditorInput();
+        } else {
+            dl->ChannelsSplit(2);
+            dl->ChannelsSetCurrent(1);
+            drawEditorInput();
 
-        SplitLines(text, lines, lineStarts);
-        BuildHighlightSpans(text, spans);
-        const int drawLineCount = static_cast<int>(lines.size());
-        int drawMaxDigits = 1;
-        for (int n = drawLineCount; n >= 10; n /= 10)
-            ++drawMaxDigits;
-        const float drawContentH = padY * 2.f + drawLineCount * lineSpacing;
+            SplitLines(text, lines, lineStarts);
+            BuildHighlightSpans(text, spans);
+            const int drawLineCount = static_cast<int>(lines.size());
+            int drawMaxDigits = 1;
+            for (int n = drawLineCount; n >= 10; n /= 10)
+                ++drawMaxDigits;
+            const float drawContentH = padY * 2.f + drawLineCount * lineSpacing;
 
-        dl->ChannelsSetCurrent(0);
-        dl->PushClipRect(clipMin, clipMax, true);
-        DrawHighlightedLines(dl, font, fontSize, lineSpacing, origin, lineNumColW, codeX0, padY, drawContentH,
-                             drawMaxDigits, drawLineCount, lines, lineStarts, spans, true);
-        dl->PopClipRect();
-        dl->ChannelsMerge();
+            dl->ChannelsSetCurrent(0);
+            dl->PushClipRect(clipMin, clipMax, true);
+            DrawHighlightedLines(dl, font, fontSize, lineSpacing, origin, lineNumColW, codeX0, padY, drawContentH,
+                                 drawMaxDigits, drawLineCount, lines, lineStarts, spans, true);
+            dl->PopClipRect();
+            dl->ChannelsMerge();
+        }
 
         ImGui::PopStyleColor(2);
 
@@ -612,6 +631,10 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
         ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(kDefaultColor));
         drawEditorInput();
         ImGui::PopStyleColor(2);
+        if (readOnly && (ImGui::IsItemActive() || ImGui::IsItemFocused())) {
+            DrawCodeEditorCaret(ImGui::GetForegroundDrawList(), text, selCallbackState.cursorPos,
+                                ImGui::GetItemRectMin(), padX, padY, fontSize, clipMin, clipMax);
+        }
     }
 
     ImGui::PopStyleVar(2);
@@ -632,6 +655,16 @@ inline void DrawEditableJsonView(const char* id, std::string& text, const ImVec2
 inline void DrawEditablePlainView(const char* id, std::string& text, const ImVec2& size, ImFont* font)
 {
     DrawEditableCodeView(id, text, size, font, false);
+}
+
+inline void DrawSelectableJsonView(const char* id, std::string& text, const ImVec2& size, ImFont* font)
+{
+    DrawEditableCodeView(id, text, size, font, true, true);
+}
+
+inline void DrawSelectablePlainView(const char* id, std::string& text, const ImVec2& size, ImFont* font)
+{
+    DrawEditableCodeView(id, text, size, font, false, true);
 }
 
 } // namespace JsonHighlight
