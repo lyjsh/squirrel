@@ -623,6 +623,17 @@ bool MethodAllowsMultipart(const std::string& m)
     return m == "POST" || m == "PUT";
 }
 
+void ApplyMethodBodyDefaults(const std::string& method, int& bodyMode, int& rawContentTypeMode, int& pendingReqTab)
+{
+    if (!MethodAllowsBody(ToUpper(method))) {
+        bodyMode = 0;
+        return;
+    }
+    bodyMode = 1;
+    rawContentTypeMode = 0;
+    pendingReqTab = 4;
+}
+
 #if defined(_WIN32)
 bool PickOpenFilePath(std::string& outPath)
 {
@@ -929,6 +940,79 @@ void PopOutlinedButtonStyle()
 {
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(4);
+}
+
+void PushCopyableFieldStyle(const ImVec4* textColor = nullptr, bool highlighted = false)
+{
+    using namespace Material;
+    if (highlighted)
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, kPrimaryContainer);
+    else
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.f, 0.f, 0.f, 0.f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.f, 0.f, 0.f, 0.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2.f, 3.f));
+    if (textColor)
+        ImGui::PushStyleColor(ImGuiCol_Text, *textColor);
+}
+
+void PopCopyableFieldStyle(bool hasTextColor)
+{
+    if (hasTextColor)
+        ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+}
+
+void CopyableLine(const char* id, std::string& text, const ImVec4* textColor = nullptr, float width = -1.f,
+                  bool highlighted = false)
+{
+    PushCopyableFieldStyle(textColor, highlighted);
+    if (width < 0.f)
+        ImGui::SetNextItemWidth(width);
+    else if (width > 0.f)
+        ImGui::SetNextItemWidth(width);
+    else
+        ImGui::SetNextItemWidth(ImGui::CalcTextSize(text.c_str()).x + ImGui::GetStyle().FramePadding.x * 2.f + 6.f);
+    ImGui::InputText(id, &text, ImGuiInputTextFlags_ReadOnly);
+    PopCopyableFieldStyle(textColor != nullptr);
+}
+
+void CopyableBlock(const char* id, std::string& text, const ImVec4* textColor = nullptr)
+{
+    const float lineH = ImGui::GetTextLineHeightWithSpacing();
+    const int lines = std::max(1, JsonHighlight::CountLines(text));
+    PushCopyableFieldStyle(textColor);
+    ImGui::SetNextItemWidth(-1.f);
+    ImGui::InputTextMultiline(id, &text, ImVec2(-1.f, lineH * static_cast<float>(lines)),
+                              ImGuiInputTextFlags_ReadOnly);
+    PopCopyableFieldStyle(textColor != nullptr);
+}
+
+std::string BuildResponseSummaryText(const std::string& statusLine, const std::string& timeLine, size_t lastBodyBytes,
+                                     const std::string& respBodyText, const std::string& downloadLine)
+{
+    std::string out = statusLine;
+    if (!timeLine.empty()) {
+        if (!out.empty())
+            out += "  ";
+        out += timeLine;
+    }
+    if (lastBodyBytes > 0) {
+        out += " | ";
+        out += std::to_string(lastBodyBytes);
+        out += " B";
+    }
+    if (!respBodyText.empty()) {
+        out += " | ";
+        out += std::to_string(JsonHighlight::CountLines(respBodyText));
+        out += " 行";
+    }
+    if (!downloadLine.empty()) {
+        out += " | ";
+        out += downloadLine;
+    }
+    return out;
 }
 
 bool DrawRowOpButton(const char* labelWithId)
@@ -1549,13 +1633,13 @@ int main()
     ImGui_ImplOpenGL2_CreateFontsTexture();
     (void)HttpWinWarmup();
 
-    std::string method = "GET";
+    std::string method = "POST";
     std::string url;
     std::vector<std::tuple<bool, std::string, std::string, std::string>> queryRows;
     queryRows.emplace_back(true, std::string(), std::string(), std::string());
     std::vector<std::pair<std::string, std::string>> headerRows;
     headerRows.emplace_back(std::string(), std::string());
-    int bodyMode = 0;
+    int bodyMode = 1;
     std::string reqBody;
     int rawContentTypeMode = 0;
     std::vector<std::tuple<bool, std::string, std::string>> formRows;
@@ -1601,6 +1685,8 @@ int main()
 
     CookieJar cookieJar;
     cookieJar.LoadFromDisk();
+
+    int pendingReqTab = 4; // 首次启动默认打开 Body（JSON）
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -1722,9 +1808,21 @@ int main()
             ImGui::PushID(i);
             const bool sel = (selectedHistoryIdx == i);
             const float rowH = ImGui::GetTextLineHeightWithSpacing() + 4.f;
-            // 不要用 width=-1：部分 ImGui 版本下 Selectable 会得到无效/不可见命中框，点击不触发。
-            // 也不用 ImGuiSelectableFlags_SpanAvailWidth：旧版 ImGui 无该枚举；显式用当前行可用宽度即可。
             const float rowW = std::max(1.f, ImGui::GetContentRegionAvail().x);
+
+            const std::string m = ToUpper(e.method);
+            ImVec4 mcol = Material::kOnSurfaceVariant;
+            if (m == "GET")
+                mcol = Material::kSuccess;
+            else if (m == "POST")
+                mcol = Material::kWarning;
+            else if (m == "PUT")
+                mcol = Material::kPrimary;
+            else if (m == "PATCH")
+                mcol = ImVec4(0.576f, 0.204f, 0.902f, 1.f);
+            else if (m == "DELETE")
+                mcol = Material::kError;
+
             if (ImGui::Selectable("##histrow", sel, 0, ImVec2(rowW, rowH))) {
                 selectedHistoryIdx = i;
                 historyClicked = true;
@@ -1745,25 +1843,14 @@ int main()
                 multipartRows = e.multipartRows;
                 if (multipartRows.empty())
                     multipartRows.emplace_back(true, 0, std::string(), std::string(), std::string());
+                if (e.bodyMode >= 1)
+                    pendingReqTab = 4;
             }
 
             const ImVec2 rowMin = ImGui::GetItemRectMin();
             const ImVec2 rowMax = ImGui::GetItemRectMax();
             const float textY = rowMin.y + (rowMax.y - rowMin.y - ImGui::GetTextLineHeight()) * 0.5f;
             const float textX = rowMin.x + 6.f;
-
-            const std::string m = ToUpper(e.method);
-            ImVec4 mcol = Material::kOnSurfaceVariant;
-            if (m == "GET")
-                mcol = Material::kSuccess;
-            else if (m == "POST")
-                mcol = Material::kWarning;
-            else if (m == "PUT")
-                mcol = Material::kPrimary;
-            else if (m == "PATCH")
-                mcol = ImVec4(0.576f, 0.204f, 0.902f, 1.f);
-            else if (m == "DELETE")
-                mcol = Material::kError;
 
             ImDrawList* dl = ImGui::GetWindowDrawList();
             dl->AddText(ImVec2(textX, textY), ImGui::GetColorU32(mcol), m.c_str());
@@ -1774,16 +1861,22 @@ int main()
             dl->AddText(ImVec2(urlX, textY), ImGui::GetColorU32(ImGuiCol_Text), full.c_str());
             ImGui::PopClipRect();
 
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("%s", full.c_str());
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s\n单击加载  |  双击复制 URL", full.c_str());
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    ImGui::SetClipboardText(full.c_str());
+            }
             ImGui::PopID();
         }
         if (!historyClicked)
             selectedHistoryIdx = matchedHistoryIdx;
-        if (requestHistory.empty())
-            ImGui::TextDisabled("发送请求后将显示在此\n相同请求只保留一条");
-        else if (!anyShown)
-            ImGui::TextDisabled("无匹配记录");
+        if (requestHistory.empty()) {
+            static std::string histEmptyHint = "发送请求后将显示在此\n相同请求只保留一条";
+            CopyableBlock("##hist_empty", histEmptyHint, &Material::kOnSurfaceVariant);
+        } else if (!anyShown) {
+            static std::string histNoMatchHint = "无匹配记录";
+            CopyableLine("##hist_nomatch", histNoMatchHint, &Material::kOnSurfaceVariant);
+        }
         ImGui::EndChild();
         ImGui::EndChild();
         ImGui::PopStyleColor();
@@ -1810,8 +1903,12 @@ int main()
                 break;
             }
         }
-        if (ImGui::Combo("##m", &mi, methods, IM_ARRAYSIZE(methods)))
+        if (ImGui::Combo("##m", &mi, methods, IM_ARRAYSIZE(methods))) {
+            const std::string prevMethod = method;
             method = methods[mi];
+            if (method != prevMethod)
+                ApplyMethodBodyDefaults(method, bodyMode, rawContentTypeMode, pendingReqTab);
+        }
 
         ImGui::SameLine();
         const float rightPanelW = inFlight.load() ? 350.f : 230.f;
@@ -1833,7 +1930,11 @@ int main()
             ImGui::SameLine();
             ImGui::AlignTextToFramePadding();
             const double waited = ImGui::GetTime() - reqStartTime;
-            ImGui::TextDisabled("请求中 %.1fs", static_cast<float>(waited));
+            static std::string inflightText;
+            char inflightBuf[32];
+            snprintf(inflightBuf, sizeof(inflightBuf), "请求中 %.1fs", static_cast<float>(waited));
+            inflightText = inflightBuf;
+            CopyableLine("##inflight", inflightText, &Material::kOnSurfaceVariant);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("此处为本地已等待时间（界面实时刷新）。完成后响应区「耗时」为整次请求在客户端测得的往返时间。");
             ImGui::SameLine();
@@ -1979,7 +2080,9 @@ int main()
         ImGui::PushStyleColor(ImGuiCol_ChildBg, Material::kSurfaceDim);
         ImGui::BeginChild("req_tabs_region", ImVec2(0, reqBlockH), true, reqTabChildFlags);
         if (ImGui::BeginTabBar("rtabs", ImGuiTabBarFlags_DrawSelectedOverline)) {
-            if (ImGui::BeginTabItem("Params")) {
+            if (ImGui::BeginTabItem("Params", nullptr, pendingReqTab == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                if (pendingReqTab == 0)
+                    pendingReqTab = -1;
                 RowOp qOp = RowOp::None;
                 int qOpAt = -1;
                 if (ImGui::BeginTable("pt", 4,
@@ -2036,7 +2139,8 @@ int main()
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Auth")) {
-                ImGui::TextDisabled("鉴权方式（占位，后续可接 Bearer / Basic 等）");
+                static std::string authHint = "鉴权方式（占位，后续可接 Bearer / Basic 等）";
+                CopyableBlock("##auth_hint", authHint, &Material::kOnSurfaceVariant);
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Headers##req_headers")) {
@@ -2119,7 +2223,9 @@ int main()
                 PopOutlinedButtonStyle();
                 if (!cookieActionStatus.empty()) {
                     ImGui::SameLine();
-                    ImGui::TextDisabled("%s", cookieActionStatus.c_str());
+                    static std::string cookieStatusCopy;
+                    cookieStatusCopy = cookieActionStatus;
+                    CopyableLine("##cookie_status_top", cookieStatusCopy, &Material::kOnSurfaceVariant);
                 }
 
                 constexpr float kManualPanelMinH = 104.f;
@@ -2149,9 +2255,12 @@ int main()
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
                         if (cookieJar.cookies().empty()) {
-                            ImGui::TextDisabled("暂无 Cookie");
+                            static std::string noCookieHint = "暂无 Cookie";
+                            CopyableLine("##no_cookie", noCookieHint, &Material::kOnSurfaceVariant, -1.f);
                         } else {
-                            ImGui::TextDisabled("当前 URL 无匹配 Cookie，可勾选「显示全部域名」");
+                            static std::string noMatchCookieHint =
+                                "当前 URL 无匹配 Cookie，可勾选「显示全部域名」";
+                            CopyableLine("##no_match_cookie", noMatchCookieHint, &Material::kOnSurfaceVariant, -1.f);
                         }
                     }
                     for (size_t vi = 0; vi < visibleCookies.size(); ++vi) {
@@ -2159,17 +2268,23 @@ int main()
                         const HttpCookie& c = cookieJar.cookies()[idx];
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
-                        ImGui::TextUnformatted(c.domain.c_str());
+                        std::string cookieDom = c.domain;
+                        CopyableLine(("##cdom" + std::to_string(idx)).c_str(), cookieDom, nullptr, -1.f);
                         ImGui::TableSetColumnIndex(1);
-                        ImGui::TextUnformatted(c.name.c_str());
+                        std::string cookieName = c.name;
+                        CopyableLine(("##cname" + std::to_string(idx)).c_str(), cookieName, nullptr, -1.f);
                         ImGui::TableSetColumnIndex(2);
-                        ImGui::TextUnformatted(c.value.c_str());
+                        std::string cookieVal = c.value;
+                        CopyableLine(("##cval" + std::to_string(idx)).c_str(), cookieVal, nullptr, -1.f);
                         ImGui::TableSetColumnIndex(3);
-                        ImGui::TextUnformatted(c.path.c_str());
+                        std::string cookiePath = c.path;
+                        CopyableLine(("##cpath" + std::to_string(idx)).c_str(), cookiePath, nullptr, -1.f);
                         ImGui::TableSetColumnIndex(4);
-                        ImGui::TextUnformatted(CookieJar::FormatExpiry(c).c_str());
+                        std::string cookieExp = CookieJar::FormatExpiry(c);
+                        CopyableLine(("##cexp" + std::to_string(idx)).c_str(), cookieExp, nullptr, -1.f);
                         ImGui::TableSetColumnIndex(5);
-                        ImGui::TextUnformatted(c.secure ? "Yes" : "No");
+                        std::string cookieSec = c.secure ? "Yes" : "No";
+                        CopyableLine(("##csec" + std::to_string(idx)).c_str(), cookieSec, nullptr, -1.f);
                         ImGui::TableSetColumnIndex(6);
                         if (ImGui::SmallButton(("X##cd" + std::to_string(idx)).c_str()))
                             cookieDeleteAt = static_cast<int>(idx);
@@ -2240,16 +2355,23 @@ int main()
                     tryAddCookie();
 
                 if (!cookieActionStatus.empty()) {
-                    ImGui::TextColored(cookieActionStatus.rfind("已添加", 0) == 0 ? Material::kSuccess
-                                                                                   : Material::kError,
-                                       "%s", cookieActionStatus.c_str());
+                    static std::string cookieStatusCopy2;
+                    cookieStatusCopy2 = cookieActionStatus;
+                    CopyableLine("##cookie_status_bottom", cookieStatusCopy2,
+                                 cookieActionStatus.rfind("已添加", 0) == 0 ? &Material::kSuccess
+                                                                            : &Material::kError);
                 } else {
-                    ImGui::TextDisabled("响应 Set-Cookie 会自动写入；Headers 中手动设置 Cookie 头时不会自动覆盖。");
+                    static std::string cookieHint =
+                        "响应 Set-Cookie 会自动写入；Headers 中手动设置 Cookie 头时不会自动覆盖。";
+                    CopyableBlock("##cookie_hint", cookieHint, &Material::kOnSurfaceVariant);
                 }
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Body##req_body")) {
+            if (ImGui::BeginTabItem("Body##req_body", nullptr,
+                                    pendingReqTab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) {
+                if (pendingReqTab == 4)
+                    pendingReqTab = -1;
                 const bool allow = MethodAllowsBody(ToUpper(method));
                 ImGui::BeginDisabled(!allow);
                 const char* bitems[] = {"无", "raw", "x-www-form-urlencoded", "form-data（文件上传）"};
@@ -2285,14 +2407,18 @@ int main()
                         PopTonalButtonStyle();
                         if (!bodyFormatStatus.empty()) {
                             ImGui::SameLine();
-                            ImGui::TextColored(bodyFormatOk ? Material::kSuccess : Material::kError,
-                                               "%s", bodyFormatStatus.c_str());
+                            static std::string bodyFmtCopy;
+                            bodyFmtCopy = bodyFormatStatus;
+                            CopyableLine("##body_fmt_status", bodyFmtCopy,
+                                         bodyFormatOk ? &Material::kSuccess : &Material::kError);
                         }
                     } else {
                         bodyFormatStatus.clear();
                     }
 
                     if (rawContentTypeMode == 0) {
+                        if (ImGui::IsWindowAppearing())
+                            ImGui::SetKeyboardFocusHere();
                         JsonHighlight::DrawEditableJsonView("##body_json", reqBody, ImVec2(-1, -40.f), fontCode);
                     } else {
                         JsonHighlight::DrawEditablePlainView("##body_plain", reqBody, ImVec2(-1, -40.f), fontCode);
@@ -2344,11 +2470,15 @@ int main()
                         else
                             formRows[0] = std::make_tuple(true, std::string(), std::string());
                     }
-                    ImGui::TextDisabled("发送时将自动编码并补充 Content-Type: application/x-www-form-urlencoded");
+                    static std::string formUrlHint =
+                        "发送时将自动编码并补充 Content-Type: application/x-www-form-urlencoded";
+                    CopyableBlock("##form_url_hint", formUrlHint, &Material::kOnSurfaceVariant);
                 } else if (bodyMode == 3) {
-                    ImGui::TextDisabled("multipart/form-data：可混用文本字段与文件字段");
+                    static std::string mpHint = "multipart/form-data：可混用文本字段与文件字段";
+                    CopyableBlock("##mp_hint", mpHint, &Material::kOnSurfaceVariant);
                     if (!MethodAllowsMultipart(ToUpper(method))) {
-                        ImGui::TextColored(Material::kWarning, "form-data 文件上传仅支持 POST / PUT");
+                        static std::string mpWarn = "form-data 文件上传仅支持 POST / PUT";
+                        CopyableLine("##mp_warn", mpWarn, &Material::kWarning, -1.f);
                     }
                     RowOp mpOp = RowOp::None;
                     int mpOpAt = -1;
@@ -2432,16 +2562,20 @@ int main()
                         if (PickOpenFilePath(picked))
                             std::get<3>(multipartRows[static_cast<size_t>(mpPickFileAt)]) = picked;
                     }
-                    ImGui::TextDisabled("发送为 multipart/form-data；单文件最大 64MB。");
+                    static std::string mpSendHint = "发送为 multipart/form-data；单文件最大 64MB。";
+                    CopyableBlock("##mp_send_hint", mpSendHint, &Material::kOnSurfaceVariant);
                 }
                 ImGui::EndDisabled();
                 ImGui::EndDisabled();
-                if (!allow)
-                    ImGui::TextDisabled("当前方法通常不使用 Body。");
+                if (!allow) {
+                    static std::string bodyDisabledHint = "当前方法通常不使用 Body。";
+                    CopyableLine("##body_disabled_hint", bodyDisabledHint, &Material::kOnSurfaceVariant, -1.f);
+                }
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Scripts")) {
-                ImGui::TextDisabled("Pre-request / Tests（占位）");
+                static std::string scriptsHint = "Pre-request / Tests（占位）";
+                CopyableBlock("##scripts_hint", scriptsHint, &Material::kOnSurfaceVariant);
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -2476,20 +2610,12 @@ int main()
         ImGui::PushStyleColor(ImGuiCol_ChildBg, Material::kSurfaceDim);
         ImGui::BeginChild("resp_region", ImVec2(0, respBlockH), true);
         ImGui::AlignTextToFramePadding();
-        ImGui::TextColored(StatusLineColor(lastHttpCode), "%s", statusLine.c_str());
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", timeLine.c_str());
-        ImGui::SameLine();
-        if (lastBodyBytes > 0) {
-            ImGui::TextDisabled("|  %zu B", lastBodyBytes);
-        }
-        if (!respBodyText.empty()) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("|  %d 行", JsonHighlight::CountLines(respBodyText));
-        }
-        if (!downloadLine.empty()) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("|  %s", downloadLine.c_str());
+        {
+            static std::string respSummaryText;
+            respSummaryText =
+                BuildResponseSummaryText(statusLine, timeLine, lastBodyBytes, respBodyText, downloadLine);
+            const ImVec4 statusColor = StatusLineColor(lastHttpCode);
+            CopyableLine("##resp_summary", respSummaryText, &statusColor, -1.f);
         }
 
         // 与上方请求区 rtabs 中的「Body / Headers」标签同名会导致 Tab 选中状态与内容错位，需独立 ID
@@ -2531,8 +2657,10 @@ int main()
                     }
                     if (!respFormatStatus.empty()) {
                         ImGui::SameLine();
-                        ImGui::TextColored(respFormatOk ? Material::kSuccess : Material::kError, "%s",
-                                           respFormatStatus.c_str());
+                        static std::string respFmtStatusCopy;
+                        respFmtStatusCopy = respFormatStatus;
+                        CopyableLine("##resp_fmt_status", respFmtStatusCopy,
+                                     respFormatOk ? &Material::kSuccess : &Material::kError);
                     }
                 } else {
                     respFormatStatus.clear();
@@ -2588,7 +2716,8 @@ int main()
             ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 16.f);
             if (ImGui::Begin("设置", &settingsPanelOpen, ImGuiWindowFlags_NoCollapse)) {
                 settingsPanelStoredSize = ImGui::GetWindowSize();
-                ImGui::TextUnformatted("历史记录管理");
+                static std::string settingsHistTitle = "历史记录管理";
+                CopyableLine("##settings_hist_title", settingsHistTitle, nullptr, -1.f);
                 ImGui::Separator();
                 const char* cleanupRanges[] = {"1个月前", "3个月前", "6个月前", "1年前"};
                 ImGui::SetNextItemWidth(180.f);
@@ -2631,13 +2760,18 @@ int main()
 
                 if (!historyCleanupStatus.empty()) {
                     ImGui::Spacing();
-                    ImGui::TextDisabled("%s", historyCleanupStatus.c_str());
+                    static std::string historyCleanupCopy;
+                    historyCleanupCopy = historyCleanupStatus;
+                    CopyableLine("##hist_cleanup_status", historyCleanupCopy, &Material::kOnSurfaceVariant, -1.f);
                 }
 
                 ImGui::Spacing();
                 ImGui::Separator();
-                ImGui::TextUnformatted("Cookie 管理");
-                ImGui::TextDisabled("共 %zu 条 Cookie", cookieJar.cookies().size());
+                static std::string cookieMgmtTitle = "Cookie 管理";
+                CopyableLine("##cookie_mgmt_title", cookieMgmtTitle, nullptr, -1.f);
+                static std::string cookieCountText;
+                cookieCountText = "共 " + std::to_string(cookieJar.cookies().size()) + " 条 Cookie";
+                CopyableLine("##cookie_count", cookieCountText, &Material::kOnSurfaceVariant, -1.f);
                 PushOutlinedButtonStyle();
                 if (ImGui::Button("清空全部 Cookie")) {
                     cookieJar.ClearAll();

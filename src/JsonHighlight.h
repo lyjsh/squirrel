@@ -538,9 +538,9 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
     }
 
     const ImVec2 contentSize(codeX0 + maxCodeW + padX, padY * 2.f + lineCount * lineSpacing);
-    const ImVec2 canvasPos = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(contentSize);
-    const ImVec2 origin = canvasPos;
+
+    ImGui::SetCursorPos(ImVec2(0.f, 0.f));
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 clipMin = ImGui::GetWindowPos();
@@ -575,33 +575,13 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
         ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.f, 0.f, 0.f, 0.f));
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.f, 0.f, 0.f, 0.f));
 
-        if (readOnly) {
-            BuildHighlightSpans(text, spans);
-            dl->PushClipRect(clipMin, clipMax, true);
-            DrawHighlightedLines(dl, font, fontSize, lineSpacing, origin, lineNumColW, codeX0, padY, contentSize.y,
-                                 maxDigits, lineCount, lines, lineStarts, spans, true);
-            dl->PopClipRect();
-            drawEditorInput();
-        } else {
-            dl->ChannelsSplit(2);
-            dl->ChannelsSetCurrent(1);
-            drawEditorInput();
+        BuildHighlightSpans(text, spans);
+        dl->PushClipRect(clipMin, clipMax, true);
+        DrawHighlightedLines(dl, font, fontSize, lineSpacing, origin, lineNumColW, codeX0, padY, contentSize.y,
+                             maxDigits, lineCount, lines, lineStarts, spans, true);
+        dl->PopClipRect();
 
-            SplitLines(text, lines, lineStarts);
-            BuildHighlightSpans(text, spans);
-            const int drawLineCount = static_cast<int>(lines.size());
-            int drawMaxDigits = 1;
-            for (int n = drawLineCount; n >= 10; n /= 10)
-                ++drawMaxDigits;
-            const float drawContentH = padY * 2.f + drawLineCount * lineSpacing;
-
-            dl->ChannelsSetCurrent(0);
-            dl->PushClipRect(clipMin, clipMax, true);
-            DrawHighlightedLines(dl, font, fontSize, lineSpacing, origin, lineNumColW, codeX0, padY, drawContentH,
-                                 drawMaxDigits, drawLineCount, lines, lineStarts, spans, true);
-            dl->PopClipRect();
-            dl->ChannelsMerge();
-        }
+        drawEditorInput();
 
         ImGui::PopStyleColor(2);
 
@@ -635,6 +615,11 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
             DrawCodeEditorCaret(ImGui::GetForegroundDrawList(), text, selCallbackState.cursorPos,
                                 ImGui::GetItemRectMin(), padX, padY, fontSize, clipMin, clipMax);
         }
+    }
+
+    if (contentSize.x > 1.f && contentSize.y > 1.f) {
+        ImGui::SetCursorPos(ImVec2(contentSize.x - 1.f, contentSize.y - 1.f));
+        ImGui::Dummy(ImVec2(1.f, 1.f));
     }
 
     ImGui::PopStyleVar(2);
