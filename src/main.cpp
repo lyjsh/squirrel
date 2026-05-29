@@ -736,6 +736,35 @@ bool ReadFileBinary(const std::filesystem::path& path, std::string& out, std::st
 // kind: 0=text, 1=file — (enabled, kind, name, value/path, contentType)
 using MultipartRow = std::tuple<bool, int, std::string, std::string, std::string>;
 
+void ResetRequestToBlank(std::string& method,
+                         std::string& url,
+                         std::vector<std::tuple<bool, std::string, std::string, std::string>>& queryRows,
+                         std::vector<std::pair<std::string, std::string>>& headerRows,
+                         int& bodyMode,
+                         std::string& reqBody,
+                         std::string& reqBodyBeforeFormat,
+                         int& rawContentTypeMode,
+                         std::vector<std::tuple<bool, std::string, std::string>>& formRows,
+                         std::vector<MultipartRow>& multipartRows,
+                         int& pendingReqTab)
+{
+    method = "POST";
+    url.clear();
+    queryRows.clear();
+    queryRows.emplace_back(true, std::string(), std::string(), std::string());
+    headerRows.clear();
+    headerRows.emplace_back();
+    bodyMode = 1;
+    reqBody.clear();
+    reqBodyBeforeFormat.clear();
+    rawContentTypeMode = 0;
+    formRows.clear();
+    formRows.emplace_back(true, std::string(), std::string());
+    multipartRows.clear();
+    multipartRows.emplace_back(true, 0, std::string(), std::string(), std::string());
+    pendingReqTab = 4;
+}
+
 bool BuildMultipartParts(const std::vector<MultipartRow>& rows,
                          std::vector<HttpMultipartPart>& out,
                          std::string& err)
@@ -925,6 +954,23 @@ void PopTonalButtonStyle()
     ImGui::PopStyleColor(4);
 }
 
+void PushCompactTonalButtonStyle()
+{
+    using namespace Material;
+    ImGui::PushStyleColor(ImGuiCol_Button, kPrimaryContainer);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.76f, 0.86f, 0.98f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.68f, 0.80f, 0.96f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_Text, kPrimary);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 4.f));
+}
+
+void PopCompactTonalButtonStyle()
+{
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(4);
+}
+
 void PushOutlinedButtonStyle()
 {
     using namespace Material;
@@ -1030,6 +1076,44 @@ bool DrawRowOpButton(const char* labelWithId)
     return clicked;
 }
 
+void DrawInlineStatusChip(const char* id, const char* text, bool ok, double shownAt, double now)
+{
+    using namespace Material;
+    if (!text || !text[0])
+        return;
+
+    constexpr double kVisibleSec = 2.8;
+    constexpr double kFadeSec = 0.6;
+    const double elapsed = now - shownAt;
+    if (elapsed >= kVisibleSec)
+        return;
+
+    float alpha = 1.f;
+    if (elapsed > kVisibleSec - kFadeSec)
+        alpha = static_cast<float>((kVisibleSec - elapsed) / kFadeSec);
+
+    const ImVec4 bg = ok ? ImVec4(0.878f, 0.949f, 0.894f, alpha)
+                         : ImVec4(0.992f, 0.878f, 0.878f, alpha);
+    const ImVec4 fg = ok ? ImVec4(kSuccess.x, kSuccess.y, kSuccess.z, alpha)
+                         : ImVec4(kError.x, kError.y, kError.z, alpha);
+
+    ImGui::SameLine(0.f, 8.f);
+    ImGui::PushID(id);
+    const ImVec2 pad(8.f, 3.f);
+    const ImVec2 textSize = ImGui::CalcTextSize(text);
+    const float chipH = textSize.y + pad.y * 2.f;
+    const ImVec2 size(textSize.x + pad.x * 2.f, chipH);
+
+    ImGui::InvisibleButton("##chip", size);
+    const ImVec2 p0 = ImGui::GetItemRectMin();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p0, ImVec2(p0.x + size.x, p0.y + size.y), ImGui::GetColorU32(bg), chipH * 0.5f);
+    dl->AddText(ImVec2(p0.x + pad.x, p0.y + pad.y), ImGui::GetColorU32(fg), text);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", text);
+    ImGui::PopID();
+}
+
 // 转圈加载（仅作进行中提示，与服务器响应时间无关）
 void DrawInlineSpinner(float radius, float thickness, ImU32 col)
 {
@@ -1125,61 +1209,6 @@ void PushHistoryUnique(std::vector<RequestHistoryEntry>& hist, RequestHistoryEnt
     constexpr size_t kMax = 200;
     if (hist.size() > kMax)
         hist.resize(kMax);
-}
-
-bool HistoryEntryStrictMatch(const RequestHistoryEntry& e,
-                             const std::string& method,
-                             const std::string& url,
-                             const std::vector<std::tuple<bool, std::string, std::string, std::string>>& queryRows,
-                             const std::vector<std::pair<std::string, std::string>>& headerRows,
-                             int bodyMode,
-                             const std::string& reqBody,
-                             int rawContentTypeMode,
-                             const std::vector<std::tuple<bool, std::string, std::string>>& formRows,
-                             const std::vector<MultipartRow>& multipartRows)
-{
-    return ToUpper(e.method) == ToUpper(method) && e.url == url && e.queryRows == queryRows
-        && e.headerRows == headerRows && e.bodyMode == bodyMode && e.reqBody == reqBody
-        && e.rawContentTypeMode == rawContentTypeMode && e.formRows == formRows
-        && e.multipartRows == multipartRows;
-}
-
-int FindHistoryIndexForPanel(const std::vector<RequestHistoryEntry>& history,
-                             const std::string& method,
-                             const std::string& url,
-                             const std::vector<std::tuple<bool, std::string, std::string, std::string>>& queryRows,
-                             const std::vector<std::pair<std::string, std::string>>& headerRows,
-                             int bodyMode,
-                             const std::string& reqBody,
-                             int rawContentTypeMode,
-                             const std::vector<std::tuple<bool, std::string, std::string>>& formRows,
-                             const std::vector<MultipartRow>& multipartRows,
-                             int preferredIdx)
-{
-    const std::string curMethod = ToUpper(method);
-    const std::string curFullUrl = MergeUrlQuery(url, queryRows);
-
-    for (int i = 0; i < static_cast<int>(history.size()); ++i) {
-        if (HistoryEntryStrictMatch(history[static_cast<size_t>(i)], method, url, queryRows, headerRows,
-                                    bodyMode, reqBody, rawContentTypeMode, formRows, multipartRows)) {
-            return i;
-        }
-    }
-
-    if (preferredIdx >= 0 && preferredIdx < static_cast<int>(history.size())) {
-        const RequestHistoryEntry& preferred = history[static_cast<size_t>(preferredIdx)];
-        if (ToUpper(preferred.method) == curMethod
-            && MergeUrlQuery(preferred.url, preferred.queryRows) == curFullUrl) {
-            return preferredIdx;
-        }
-    }
-
-    for (int i = 0; i < static_cast<int>(history.size()); ++i) {
-        const RequestHistoryEntry& e = history[static_cast<size_t>(i)];
-        if (ToUpper(e.method) == curMethod && MergeUrlQuery(e.url, e.queryRows) == curFullUrl)
-            return i;
-    }
-    return -1;
 }
 
 constexpr char kHistFieldSep = '\x1f';
@@ -1641,6 +1670,7 @@ int main()
     headerRows.emplace_back(std::string(), std::string());
     int bodyMode = 1;
     std::string reqBody;
+    std::string reqBodyBeforeFormat;
     int rawContentTypeMode = 0;
     std::vector<std::tuple<bool, std::string, std::string>> formRows;
     formRows.emplace_back(true, std::string(), std::string());
@@ -1649,6 +1679,7 @@ int main()
     int requestTimeoutSec = 15;
     std::string bodyFormatStatus;
     bool bodyFormatOk = true;
+    double bodyFormatStatusAt = 0.0;
     std::string downloadLine;
     int historyCleanupRange = 0;
     std::string historyCleanupStatus;
@@ -1661,6 +1692,7 @@ int main()
     std::string respBodyBeforeFormat;
     std::string respFormatStatus;
     bool respFormatOk = true;
+    double respFormatStatusAt = 0.0;
     std::string respHdrText;
     bool cookieShowAllDomains = true;
     std::string cookieActionStatus;
@@ -1682,6 +1714,7 @@ int main()
     LoadHistoryFromLog(requestHistory);
     RewriteHistoryLog(requestHistory);
     int selectedHistoryIdx = -1;
+    bool draftRequestMode = true;
 
     CookieJar cookieJar;
     cookieJar.LoadFromDisk();
@@ -1794,10 +1827,36 @@ int main()
         ImGui::Separator();
         ImGui::BeginChild("hist_list", ImVec2(0, 0), false);
         bool anyShown = false;
-        bool historyClicked = false;
-        const int matchedHistoryIdx = FindHistoryIndexForPanel(
-            requestHistory, method, url, queryRows, headerRows, bodyMode, reqBody, rawContentTypeMode,
-            formRows, multipartRows, selectedHistoryIdx);
+
+        {
+            const float draftRowH = ImGui::GetTextLineHeightWithSpacing() + 4.f;
+            const float draftRowW = std::max(1.f, ImGui::GetContentRegionAvail().x);
+            if (ImGui::Selectable("##draftrow", draftRequestMode, 0, ImVec2(draftRowW, draftRowH))) {
+                ResetRequestToBlank(method, url, queryRows, headerRows, bodyMode, reqBody, reqBodyBeforeFormat,
+                                    rawContentTypeMode, formRows, multipartRows, pendingReqTab);
+                draftRequestMode = true;
+                selectedHistoryIdx = -1;
+            }
+
+            const ImVec2 rowMin = ImGui::GetItemRectMin();
+            const ImVec2 rowMax = ImGui::GetItemRectMax();
+            const float textY = rowMin.y + (rowMax.y - rowMin.y - ImGui::GetTextLineHeight()) * 0.5f;
+            const float textX = rowMin.x + 6.f;
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImU32 plusCol =
+                ImGui::GetColorU32(draftRequestMode ? Material::kPrimary : Material::kOnSurfaceVariant);
+            const ImU32 labelCol =
+                ImGui::GetColorU32(draftRequestMode ? Material::kOnSurface : Material::kOnSurfaceVariant);
+            dl->AddText(ImVec2(textX, textY), plusCol, "+");
+            const float plusW = ImGui::CalcTextSize("+").x;
+            dl->AddText(ImVec2(textX + plusW + 6.f, textY), labelCol, "新建请求");
+
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("空白请求（POST + JSON Body）");
+        }
+        ImGui::Separator();
+        ImGui::Spacing();
+
         for (int i = 0; i < static_cast<int>(requestHistory.size()); ++i) {
             const RequestHistoryEntry& e = requestHistory[static_cast<size_t>(i)];
             const std::string full = MergeUrlQuery(e.url, e.queryRows);
@@ -1825,7 +1884,7 @@ int main()
 
             if (ImGui::Selectable("##histrow", sel, 0, ImVec2(rowW, rowH))) {
                 selectedHistoryIdx = i;
-                historyClicked = true;
+                draftRequestMode = false;
                 method = e.method;
                 url = e.url;
                 queryRows = e.queryRows;
@@ -1836,6 +1895,7 @@ int main()
                     headerRows.emplace_back();
                 bodyMode = e.bodyMode;
                 reqBody = e.reqBody;
+                reqBodyBeforeFormat.clear();
                 rawContentTypeMode = e.rawContentTypeMode;
                 formRows = e.formRows;
                 if (formRows.empty())
@@ -1868,8 +1928,6 @@ int main()
             }
             ImGui::PopID();
         }
-        if (!historyClicked)
-            selectedHistoryIdx = matchedHistoryIdx;
         if (requestHistory.empty()) {
             static std::string histEmptyHint = "发送请求后将显示在此\n相同请求只保留一条";
             CopyableBlock("##hist_empty", histEmptyHint, &Material::kOnSurfaceVariant);
@@ -2045,6 +2103,7 @@ int main()
                         he.multipartRows = multipartRows;
                         AppendHistoryLogEntry(he);
                         PushHistoryUnique(requestHistory, std::move(he));
+                        draftRequestMode = false;
                         selectedHistoryIdx = 0;
                     }
 
@@ -2389,28 +2448,42 @@ int main()
                 if (bodyMode == 1) {
                     if (rawContentTypeMode == 0 || rawContentTypeMode == 2) {
                         const bool asJson = (rawContentTypeMode == 0);
-                        PushTonalButtonStyle();
-                        if (ImGui::Button(asJson ? "格式化 JSON" : "格式化 XML")) {
-                            std::string formatted;
-                            std::string err;
-                            const bool ok = asJson
-                                ? PrettyFormatJson(reqBody, formatted, err)
-                                : PrettyFormatXml(reqBody, formatted, err);
-                            bodyFormatOk = ok;
-                            if (ok) {
-                                reqBody = formatted;
-                                bodyFormatStatus = asJson ? "JSON 格式化完成" : "XML 格式化完成";
+                        const bool showingFormatted = !reqBodyBeforeFormat.empty();
+                        const char* fmtBtnLabel = showingFormatted ? "恢复原始"
+                                                                 : (asJson ? "格式化 JSON" : "格式化 XML");
+                        PushCompactTonalButtonStyle();
+                        if (ImGui::Button(fmtBtnLabel)) {
+                            if (showingFormatted) {
+                                reqBody = reqBodyBeforeFormat;
+                                reqBodyBeforeFormat.clear();
+                                bodyFormatOk = true;
+                                bodyFormatStatus = "已恢复原始内容";
+                                bodyFormatStatusAt = ImGui::GetTime();
                             } else {
-                                bodyFormatStatus = err.empty() ? "格式化失败" : err;
+                                std::string formatted;
+                                std::string err;
+                                const bool ok = asJson
+                                    ? PrettyFormatJson(reqBody, formatted, err)
+                                    : PrettyFormatXml(reqBody, formatted, err);
+                                bodyFormatOk = ok;
+                                if (ok) {
+                                    reqBodyBeforeFormat = reqBody;
+                                    reqBody = formatted;
+                                    bodyFormatStatus = asJson ? "JSON 已格式化" : "XML 已格式化";
+                                } else {
+                                    bodyFormatStatus = err.empty() ? "格式化失败" : err;
+                                }
+                                bodyFormatStatusAt = ImGui::GetTime();
                             }
                         }
-                        PopTonalButtonStyle();
+                        PopCompactTonalButtonStyle();
                         if (!bodyFormatStatus.empty()) {
-                            ImGui::SameLine();
-                            static std::string bodyFmtCopy;
-                            bodyFmtCopy = bodyFormatStatus;
-                            CopyableLine("##body_fmt_status", bodyFmtCopy,
-                                         bodyFormatOk ? &Material::kSuccess : &Material::kError);
+                            const double now = ImGui::GetTime();
+                            if (now - bodyFormatStatusAt >= 2.8)
+                                bodyFormatStatus.clear();
+                            else
+                                DrawInlineStatusChip("body_fmt", bodyFormatStatus.c_str(), bodyFormatOk,
+                                                     bodyFormatStatusAt, now);
                         }
                     } else {
                         bodyFormatStatus.clear();
@@ -2626,41 +2699,42 @@ int main()
                 const bool respAsXml = !respAsJson && JsonHighlight::LooksLikeXml(respBodyText);
                 const bool showRespFormatBar = respAsJson || respAsXml;
                 if (showRespFormatBar) {
-                    PushTonalButtonStyle();
-                    if (ImGui::Button(respAsJson ? "格式化 JSON" : "格式化 XML")) {
-                        std::string formatted;
-                        std::string err;
-                        const bool ok = respAsJson
-                            ? PrettyFormatJson(respBodyText, formatted, err)
-                            : PrettyFormatXml(respBodyText, formatted, err);
-                        respFormatOk = ok;
-                        if (ok) {
-                            if (respBodyBeforeFormat.empty())
-                                respBodyBeforeFormat = respBodyText;
-                            respBodyText = formatted;
-                            respFormatStatus = respAsJson ? "JSON 格式化完成" : "XML 格式化完成";
-                        } else {
-                            respFormatStatus = err.empty() ? "格式化失败" : err;
-                        }
-                    }
-                    PopTonalButtonStyle();
-                    if (!respBodyBeforeFormat.empty()) {
-                        ImGui::SameLine();
-                        PushTonalButtonStyle();
-                        if (ImGui::Button("恢复原始")) {
+                    const bool showingFormatted = !respBodyBeforeFormat.empty();
+                    const char* fmtBtnLabel = showingFormatted ? "恢复原始"
+                                                               : (respAsJson ? "格式化 JSON" : "格式化 XML");
+                    PushCompactTonalButtonStyle();
+                    if (ImGui::Button(fmtBtnLabel)) {
+                        if (showingFormatted) {
                             respBodyText = respBodyBeforeFormat;
                             respBodyBeforeFormat.clear();
                             respFormatOk = true;
                             respFormatStatus = "已恢复原始内容";
+                            respFormatStatusAt = ImGui::GetTime();
+                        } else {
+                            std::string formatted;
+                            std::string err;
+                            const bool ok = respAsJson
+                                ? PrettyFormatJson(respBodyText, formatted, err)
+                                : PrettyFormatXml(respBodyText, formatted, err);
+                            respFormatOk = ok;
+                            if (ok) {
+                                respBodyBeforeFormat = respBodyText;
+                                respBodyText = formatted;
+                                respFormatStatus = respAsJson ? "JSON 已格式化" : "XML 已格式化";
+                            } else {
+                                respFormatStatus = err.empty() ? "格式化失败" : err;
+                            }
+                            respFormatStatusAt = ImGui::GetTime();
                         }
-                        PopTonalButtonStyle();
                     }
+                    PopCompactTonalButtonStyle();
                     if (!respFormatStatus.empty()) {
-                        ImGui::SameLine();
-                        static std::string respFmtStatusCopy;
-                        respFmtStatusCopy = respFormatStatus;
-                        CopyableLine("##resp_fmt_status", respFmtStatusCopy,
-                                     respFormatOk ? &Material::kSuccess : &Material::kError);
+                        const double now = ImGui::GetTime();
+                        if (now - respFormatStatusAt >= 2.8)
+                            respFormatStatus.clear();
+                        else
+                            DrawInlineStatusChip("resp_fmt", respFormatStatus.c_str(), respFormatOk,
+                                                 respFormatStatusAt, now);
                     }
                 } else {
                     respFormatStatus.clear();
@@ -2743,8 +2817,10 @@ int main()
                         requestHistory.end());
                     const size_t removed = before - requestHistory.size();
                     RewriteHistoryLog(requestHistory);
-                    if (selectedHistoryIdx >= static_cast<int>(requestHistory.size()))
+                    if (selectedHistoryIdx >= static_cast<int>(requestHistory.size())) {
                         selectedHistoryIdx = -1;
+                        draftRequestMode = true;
+                    }
                     historyCleanupStatus = "已清理 " + std::to_string(removed) + " 条历史记录";
                 }
                 PopTonalButtonStyle();
@@ -2753,6 +2829,7 @@ int main()
                 if (ImGui::Button("清空全部历史")) {
                     requestHistory.clear();
                     selectedHistoryIdx = -1;
+                    draftRequestMode = true;
                     RewriteHistoryLog(requestHistory);
                     historyCleanupStatus = "历史记录已全部清空";
                 }
