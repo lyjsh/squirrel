@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdio>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -220,6 +221,113 @@ inline ImU32 ColorAtSequential(const std::vector<Span>& spans, size_t pos, size_
     return fallback;
 }
 
+inline bool IsEditorWordChar(char ch)
+{
+    const unsigned char c = static_cast<unsigned char>(ch);
+    return std::isalnum(c) || ch == '_';
+}
+
+inline bool IsUtf8ContinuationByte(unsigned char c)
+{
+    return (c & 0xC0u) == 0x80u;
+}
+
+inline int Utf8CharStartAtOrBefore(const std::string& text, int byteIndex)
+{
+    const int textLen = static_cast<int>(text.size());
+    byteIndex = std::clamp(byteIndex, 0, std::max(0, textLen - 1));
+    while (byteIndex > 0 && IsUtf8ContinuationByte(static_cast<unsigned char>(text[static_cast<size_t>(byteIndex)])))
+        --byteIndex;
+    return byteIndex;
+}
+
+inline int Utf8NextChar(const std::string& text, int byteIndex)
+{
+    const int textLen = static_cast<int>(text.size());
+    if (byteIndex >= textLen)
+        return textLen;
+    ++byteIndex;
+    while (byteIndex < textLen &&
+           IsUtf8ContinuationByte(static_cast<unsigned char>(text[static_cast<size_t>(byteIndex)])))
+        ++byteIndex;
+    return byteIndex;
+}
+
+inline int Utf8PrevChar(const std::string& text, int byteIndex)
+{
+    if (byteIndex <= 0)
+        return 0;
+    --byteIndex;
+    while (byteIndex > 0 && IsUtf8ContinuationByte(static_cast<unsigned char>(text[static_cast<size_t>(byteIndex)])))
+        --byteIndex;
+    return byteIndex;
+}
+
+inline bool IsNonAsciiWordStart(const std::string& text, int byteIndex)
+{
+    if (byteIndex < 0 || byteIndex >= static_cast<int>(text.size()))
+        return false;
+    const unsigned char c = static_cast<unsigned char>(text[static_cast<size_t>(byteIndex)]);
+    return c >= 0x80u && !IsUtf8ContinuationByte(c);
+}
+
+inline bool IsNumberToken(std::string_view token)
+{
+    if (token.empty())
+        return false;
+    size_t i = token.front() == '-' ? 1 : 0;
+    if (i >= token.size())
+        return false;
+    bool hasDigit = false;
+    for (; i < token.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(token[i]);
+        if (std::isdigit(c)) {
+            hasDigit = true;
+            continue;
+        }
+        if (token[i] == '.' || token[i] == 'e' || token[i] == 'E' || token[i] == '+' || token[i] == '-')
+            continue;
+        return false;
+    }
+    return hasDigit;
+}
+
+inline bool IsKeywordToken(std::string_view token)
+{
+    return token == "true" || token == "false" || token == "null";
+}
+
+inline std::pair<int, int> ExpandEditorWordAt(const std::string& text, int byteIndex)
+{
+    const int textLen = static_cast<int>(text.size());
+    byteIndex = Utf8CharStartAtOrBefore(text, byteIndex);
+
+    if (IsNonAsciiWordStart(text, byteIndex)) {
+        int start = byteIndex;
+        int end = Utf8NextChar(text, byteIndex);
+        while (start > 0) {
+            const int prev = Utf8PrevChar(text, start);
+            if (!IsNonAsciiWordStart(text, prev))
+                break;
+            start = prev;
+        }
+        while (end < textLen && IsNonAsciiWordStart(text, end))
+            end = Utf8NextChar(text, end);
+        return {start, end};
+    }
+
+    if (byteIndex < 0 || byteIndex >= textLen || !IsEditorWordChar(text[static_cast<size_t>(byteIndex)]))
+        return {byteIndex, byteIndex};
+
+    int start = byteIndex;
+    int end = byteIndex + 1;
+    while (start > 0 && IsEditorWordChar(text[static_cast<size_t>(start - 1)]))
+        --start;
+    while (end < textLen && IsEditorWordChar(text[static_cast<size_t>(end)]))
+        ++end;
+    return {start, end};
+}
+
 inline int ByteIndexFromMousePos(const ImVec2& mousePos, const ImVec2& frameMin, float padX, float padY,
                                  float lineSpacing, const std::vector<std::string_view>& lines,
                                  const std::vector<size_t>& lineStarts)
@@ -262,25 +370,23 @@ inline std::pair<int, int> FindDoubleClickSelectionRange(const std::string& text
     if (jsonAware) {
         static thread_local std::vector<Span> spans;
         BuildHighlightSpans(text, spans);
+        const int charIndex = byteIndex < textLen ? Utf8CharStartAtOrBefore(text, byteIndex) : byteIndex;
         for (const Span& sp : spans) {
-            if (byteIndex >= static_cast<int>(sp.start) && byteIndex < static_cast<int>(sp.end))
-                return {static_cast<int>(sp.start), static_cast<int>(sp.end)};
+            if (byteIndex >= static_cast<int>(sp.start) && byteIndex < static_cast<int>(sp.end)) {
+                const std::string_view token(text.data() + sp.start, sp.end - sp.start);
+                if (sp.color == kNumberColor || IsKeywordToken(token) || IsNumberToken(token))
+                    return {static_cast<int>(sp.start), static_cast<int>(sp.end)};
+                if (IsNonAsciiWordStart(text, charIndex) || IsEditorWordChar(text[static_cast<size_t>(charIndex)]))
+                    return ExpandEditorWordAt(text, charIndex);
+                return {byteIndex, byteIndex + 1};
+            }
         }
     }
 
-    const auto isWordChar = [](char ch) {
-        const unsigned char c = static_cast<unsigned char>(ch);
-        return std::isalnum(c) || ch == '_' || ch == '-' || ch == '.';
-    };
-
-    if (byteIndex < textLen && isWordChar(text[static_cast<size_t>(byteIndex)])) {
-        int start = byteIndex;
-        int end = byteIndex + 1;
-        while (start > 0 && isWordChar(text[static_cast<size_t>(start - 1)]))
-            --start;
-        while (end < textLen && isWordChar(text[static_cast<size_t>(end)]))
-            ++end;
-        return {start, end};
+    if (byteIndex < textLen) {
+        const int charIndex = Utf8CharStartAtOrBefore(text, byteIndex);
+        if (IsNonAsciiWordStart(text, charIndex) || IsEditorWordChar(text[static_cast<size_t>(charIndex)]))
+            return ExpandEditorWordAt(text, charIndex);
     }
 
     if (byteIndex < textLen)
