@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace JsonHighlight {
@@ -29,6 +30,29 @@ struct Span {
     size_t end = 0;
     ImU32 color = kDefaultColor;
 };
+
+inline std::pair<int, int> NormalizeSelectionRange(int start, int end, int textLen)
+{
+    textLen = std::max(0, textLen);
+    start = std::clamp(start, 0, textLen);
+    end = std::clamp(end, 0, textLen);
+    if (start > end)
+        std::swap(start, end);
+    return {start, end};
+}
+
+inline std::pair<int, int> ComputeVisibleLineRange(float scrollY, float viewHeight, float lineHeight, int lineCount)
+{
+    if (lineCount <= 0)
+        return {0, 0};
+    if (lineHeight <= 0.f || viewHeight <= 0.f)
+        return {0, lineCount};
+
+    const int first = std::clamp(static_cast<int>(std::floor(scrollY / lineHeight)) - 1, 0, lineCount);
+    const int last = std::clamp(static_cast<int>(std::ceil((scrollY + viewHeight) / lineHeight)) + 1,
+                                first, lineCount);
+    return {first, last};
+}
 
 inline std::string_view TrimView(std::string_view s)
 {
@@ -186,6 +210,16 @@ inline void SplitLines(const std::string& text, std::vector<std::string_view>& l
     }
 }
 
+inline ImU32 ColorAtSequential(const std::vector<Span>& spans, size_t pos, size_t& spanIdx,
+                               ImU32 fallback = kDefaultColor)
+{
+    while (spanIdx < spans.size() && pos >= spans[spanIdx].end)
+        ++spanIdx;
+    if (spanIdx < spans.size() && pos >= spans[spanIdx].start && pos < spans[spanIdx].end)
+        return spans[spanIdx].color;
+    return fallback;
+}
+
 inline int ByteIndexFromMousePos(const ImVec2& mousePos, const ImVec2& frameMin, float padX, float padY,
                                  float lineSpacing, const std::vector<std::string_view>& lines,
                                  const std::vector<size_t>& lineStarts)
@@ -279,8 +313,9 @@ inline int InputTextSelectionCallback(ImGuiInputTextCallbackData* data)
 
     const int pendingEnd = state->storage->GetInt(state->endId, -1);
     const int textLen = static_cast<int>(data->BufTextLen);
-    data->SelectionStart = std::clamp(pendingStart, 0, textLen);
-    data->SelectionEnd = std::clamp(pendingEnd, 0, textLen);
+    const std::pair<int, int> range = NormalizeSelectionRange(pendingStart, pendingEnd, textLen);
+    data->SelectionStart = range.first;
+    data->SelectionEnd = range.second;
     state->storage->SetInt(state->startId, -1);
     state->storage->SetInt(state->endId, -1);
     state->selectionStart = data->SelectionStart;
@@ -463,14 +498,23 @@ inline void DrawHighlightedLines(ImDrawList* dl, ImFont* font, float fontSize, f
                                  float contentH, int maxDigits, int lineCount,
                                  const std::vector<std::string_view>& lines,
                                  const std::vector<size_t>& lineStarts, const std::vector<Span>& spans,
-                                 bool jsonHighlight)
+                                 bool jsonHighlight, int firstLine, int lastLine)
 {
     dl->AddRectFilled(ImVec2(origin.x, origin.y), ImVec2(origin.x + lineNumColW, origin.y + contentH),
                       kLineNumBg);
     dl->AddLine(ImVec2(origin.x + lineNumColW, origin.y), ImVec2(origin.x + lineNumColW, origin.y + contentH),
                 kLineNumSep);
 
-    for (int li = 0; li < lineCount; ++li) {
+    firstLine = std::clamp(firstLine, 0, lineCount);
+    lastLine = std::clamp(lastLine, firstLine, lineCount);
+    size_t spanIdx = 0;
+    if (jsonHighlight && firstLine < lineCount && firstLine >= 0) {
+        const size_t firstPos = lineStarts[static_cast<size_t>(firstLine)];
+        while (spanIdx < spans.size() && spans[spanIdx].end <= firstPos)
+            ++spanIdx;
+    }
+
+    for (int li = firstLine; li < lastLine; ++li) {
         const std::string_view line = lines[static_cast<size_t>(li)];
         const size_t lineOffset = lineStarts[static_cast<size_t>(li)];
         const float y = origin.y + padY + li * lineHeight;
@@ -485,13 +529,17 @@ inline void DrawHighlightedLines(ImDrawList* dl, ImFont* font, float fontSize, f
         size_t col = 0;
         while (col < line.size()) {
             const size_t absPos = lineOffset + col;
-            const ImU32 colColor = jsonHighlight ? ColorAt(spans, absPos) : kDefaultColor;
+            const ImU32 colColor = jsonHighlight ? ColorAtSequential(spans, absPos, spanIdx) : kDefaultColor;
             size_t runEnd = col + 1;
+            size_t nextSpanIdx = spanIdx;
             while (runEnd < line.size()) {
-                const ImU32 nextColor = jsonHighlight ? ColorAt(spans, lineOffset + runEnd) : kDefaultColor;
+                const ImU32 nextColor = jsonHighlight
+                    ? ColorAtSequential(spans, lineOffset + runEnd, nextSpanIdx)
+                    : kDefaultColor;
                 if (nextColor != colColor)
                     break;
                 ++runEnd;
+                spanIdx = nextSpanIdx;
             }
             const std::string_view segment(line.data() + col, runEnd - col);
             DrawColoredTextSegment(dl, font, fontSize, x, y, segment, colColor);
@@ -508,6 +556,7 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
     static thread_local std::vector<std::string_view> lines;
     static thread_local std::vector<size_t> lineStarts;
 
+    ImGui::PushID(id);
     SplitLines(text, lines, lineStarts);
 
     const int lineCount = static_cast<int>(lines.size());
@@ -515,7 +564,6 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
     for (int n = lineCount; n >= 10; n /= 10)
         ++maxDigits;
 
-    ImGui::PushID(id);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, kCodeBg);
     ImGui::BeginChild("wrap", viewSize, false, ImGuiWindowFlags_HorizontalScrollbar);
 
@@ -545,6 +593,8 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 clipMin = ImGui::GetWindowPos();
     const ImVec2 clipMax(clipMin.x + ImGui::GetWindowSize().x, clipMin.y + ImGui::GetWindowSize().y);
+    const std::pair<int, int> visibleLines =
+        ComputeVisibleLineRange(ImGui::GetScrollY(), ImGui::GetWindowHeight(), lineSpacing, lineCount);
     const ImVec2 inputSize(contentSize.x - lineNumColW, contentSize.y);
 
     ImGui::SetCursorPos(ImVec2(lineNumColW, 0.f));
@@ -578,7 +628,8 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
         BuildHighlightSpans(text, spans);
         dl->PushClipRect(clipMin, clipMax, true);
         DrawHighlightedLines(dl, font, fontSize, lineSpacing, origin, lineNumColW, codeX0, padY, contentSize.y,
-                             maxDigits, lineCount, lines, lineStarts, spans, true);
+                             maxDigits, lineCount, lines, lineStarts, spans, true,
+                             visibleLines.first, visibleLines.second);
         dl->PopClipRect();
 
         drawEditorInput();
@@ -595,7 +646,7 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
                           kLineNumBg);
         dl->AddLine(ImVec2(origin.x + lineNumColW, origin.y),
                     ImVec2(origin.x + lineNumColW, origin.y + contentSize.y), kLineNumSep);
-        for (int li = 0; li < lineCount; ++li) {
+        for (int li = visibleLines.first; li < visibleLines.second; ++li) {
             const float y = origin.y + padY + static_cast<float>(li) * lineSpacing;
             if (y + lineSpacing < clipMin.y || y > clipMax.y)
                 continue;

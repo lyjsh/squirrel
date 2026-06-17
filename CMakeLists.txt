@@ -153,3 +153,16 @@ endif()
 if(MINGW)
     target_link_libraries(squirrel PRIVATE -static)
 endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(squirrel_json_view_tests EXCLUDE_FROM_ALL
+        tests/json_view_tests.cpp
+    )
+    target_include_directories(squirrel_json_view_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/misc/cpp
+    )
+    add_test(NAME squirrel_json_view_tests COMMAND squirrel_json_view_tests)
+endif()

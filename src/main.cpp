@@ -1036,7 +1036,7 @@ void CopyableBlock(const char* id, std::string& text, const ImVec4* textColor = 
 }
 
 std::string BuildResponseSummaryText(const std::string& statusLine, const std::string& timeLine, size_t lastBodyBytes,
-                                     const std::string& respBodyText, const std::string& downloadLine)
+                                     int respBodyLineCount, const std::string& downloadLine)
 {
     std::string out = statusLine;
     if (!timeLine.empty()) {
@@ -1049,9 +1049,9 @@ std::string BuildResponseSummaryText(const std::string& statusLine, const std::s
         out += std::to_string(lastBodyBytes);
         out += " B";
     }
-    if (!respBodyText.empty()) {
+    if (respBodyLineCount > 0) {
         out += " | ";
-        out += std::to_string(JsonHighlight::CountLines(respBodyText));
+        out += std::to_string(respBodyLineCount);
         out += " 行";
     }
     if (!downloadLine.empty()) {
@@ -2685,8 +2685,16 @@ int main()
         ImGui::AlignTextToFramePadding();
         {
             static std::string respSummaryText;
+            static const char* cachedRespBodyData = nullptr;
+            static size_t cachedRespBodySize = 0;
+            static int cachedRespBodyLineCount = 0;
+            if (cachedRespBodyData != respBodyText.data() || cachedRespBodySize != respBodyText.size()) {
+                cachedRespBodyData = respBodyText.data();
+                cachedRespBodySize = respBodyText.size();
+                cachedRespBodyLineCount = respBodyText.empty() ? 0 : JsonHighlight::CountLines(respBodyText);
+            }
             respSummaryText =
-                BuildResponseSummaryText(statusLine, timeLine, lastBodyBytes, respBodyText, downloadLine);
+                BuildResponseSummaryText(statusLine, timeLine, lastBodyBytes, cachedRespBodyLineCount, downloadLine);
             const ImVec4 statusColor = StatusLineColor(lastHttpCode);
             CopyableLine("##resp_summary", respSummaryText, &statusColor, -1.f);
         }
@@ -2741,6 +2749,12 @@ int main()
                 }
 
                 const float respViewBottom = showRespFormatBar ? -40.f : -6.f;
+                if (showRespFormatBar)
+                    ImGui::SameLine();
+                PushCompactTonalButtonStyle();
+                if (ImGui::Button("复制 Body"))
+                    ImGui::SetClipboardText(respBodyText.c_str());
+                PopCompactTonalButtonStyle();
                 if (respAsJson) {
                     JsonHighlight::DrawSelectableJsonView("##resp_json_view", respBodyText,
                                                           ImVec2(-1, respViewBottom), fontCode);
@@ -2751,6 +2765,10 @@ int main()
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Headers##resp_headers")) {
+                PushCompactTonalButtonStyle();
+                if (ImGui::Button("复制 Headers"))
+                    ImGui::SetClipboardText(respHdrText.c_str());
+                PopCompactTonalButtonStyle();
                 JsonHighlight::DrawSelectablePlainView("##resp_hdr_view", respHdrText, ImVec2(-1, -6), fontCode);
                 ImGui::EndTabItem();
             }
