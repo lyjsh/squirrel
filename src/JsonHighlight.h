@@ -4,6 +4,7 @@
 #include "imgui_stdlib.h"
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cctype>
 #include <cstdio>
@@ -25,6 +26,7 @@ constexpr ImU32 kLineNumColor = IM_COL32(154, 160, 166, 255);
 constexpr ImU32 kLineNumBg = IM_COL32(248, 249, 250, 255);
 constexpr ImU32 kCodeBg = IM_COL32(255, 255, 255, 255);
 constexpr ImU32 kLineNumSep = IM_COL32(218, 220, 224, 255);
+constexpr float kTrailingSelectionPadding = 96.f;
 
 struct Span {
     size_t start = 0;
@@ -53,6 +55,76 @@ inline std::pair<int, int> ComputeVisibleLineRange(float scrollY, float viewHeig
     const int last = std::clamp(static_cast<int>(std::ceil((scrollY + viewHeight) / lineHeight)) + 1,
                                 first, lineCount);
     return {first, last};
+}
+
+inline float ComputeCodeContentWidth(float codeX0, float maxCodeW, float padX, float minWidth = 0.f)
+{
+    return std::max(minWidth, codeX0 + maxCodeW + padX + kTrailingSelectionPadding);
+}
+
+inline float ComputeCodeContentWidth(float codeX0, float maxCodeW, float padX, float minWidth, float viewportWidth)
+{
+    const float tailSlack = std::max(kTrailingSelectionPadding, std::max(0.f, viewportWidth) * 0.5f);
+    return std::max(minWidth, codeX0 + maxCodeW + padX + tailSlack);
+}
+
+inline float ComputeLineNumberColumnWidth(int maxDigits, int lineCount, float padX)
+{
+    char sampleLineNum[16];
+    snprintf(sampleLineNum, sizeof(sampleLineNum), "%*d", maxDigits, lineCount);
+    return ImGui::CalcTextSize(sampleLineNum).x + padX * 2.f + 4.f;
+}
+
+inline float MeasureCodeTextWidth(ImFont* font, float fontSize, const char* textBegin, const char* textEnd)
+{
+    if (!textBegin || textBegin == textEnd)
+        return 0.f;
+
+    ImFont* measureFont = font ? font : ImGui::GetFont();
+    if (!measureFont)
+        return 0.f;
+
+    const float measureSize = fontSize > 0.f ? fontSize : ImGui::GetFontSize();
+    return measureFont->CalcTextSizeA(measureSize, FLT_MAX, 0.0f, textBegin, textEnd).x;
+}
+
+inline float MeasureCodeTextWidth(ImFont* font, float fontSize, std::string_view text)
+{
+    return MeasureCodeTextWidth(font, fontSize, text.data(), text.data() + text.size());
+}
+
+inline float ComputeMaxLineWidth(const std::vector<std::string_view>& lines, ImFont* font, float fontSize)
+{
+    float maxCodeW = 0.f;
+    for (const std::string_view line : lines) {
+        const float w = MeasureCodeTextWidth(font, fontSize, line);
+        maxCodeW = std::max(maxCodeW, w);
+    }
+    return std::ceil(maxCodeW);
+}
+
+inline float ResolveViewExtent(float requested, float available)
+{
+    if (requested < 0.f)
+        return std::max(1.f, available + requested);
+    if (requested == 0.f)
+        return std::max(1.f, available);
+    return requested;
+}
+
+inline float ComputeScrollForContentX(float currentScrollX, float visibleWidth, float contentX, float padX,
+                                      float trailingPadding, float maxScrollX)
+{
+    const float leftVisible = currentScrollX + padX;
+    const float rightVisible = currentScrollX + std::max(1.f, visibleWidth) - padX;
+    float targetScrollX = currentScrollX;
+
+    if (contentX + trailingPadding > rightVisible)
+        targetScrollX = contentX + trailingPadding - std::max(1.f, visibleWidth) + padX;
+    else if (contentX < leftVisible)
+        targetScrollX = contentX - padX;
+
+    return std::clamp(targetScrollX, 0.f, std::max(0.f, maxScrollX));
 }
 
 inline std::string_view TrimView(std::string_view s)
@@ -232,16 +304,18 @@ inline bool IsUtf8ContinuationByte(unsigned char c)
     return (c & 0xC0u) == 0x80u;
 }
 
-inline int Utf8CharStartAtOrBefore(const std::string& text, int byteIndex)
+inline int Utf8CharStartAtOrBefore(std::string_view text, int byteIndex)
 {
     const int textLen = static_cast<int>(text.size());
-    byteIndex = std::clamp(byteIndex, 0, std::max(0, textLen - 1));
+    byteIndex = std::clamp(byteIndex, 0, textLen);
+    if (byteIndex == textLen)
+        return textLen;
     while (byteIndex > 0 && IsUtf8ContinuationByte(static_cast<unsigned char>(text[static_cast<size_t>(byteIndex)])))
         --byteIndex;
     return byteIndex;
 }
 
-inline int Utf8NextChar(const std::string& text, int byteIndex)
+inline int Utf8NextChar(std::string_view text, int byteIndex)
 {
     const int textLen = static_cast<int>(text.size());
     if (byteIndex >= textLen)
@@ -253,7 +327,7 @@ inline int Utf8NextChar(const std::string& text, int byteIndex)
     return byteIndex;
 }
 
-inline int Utf8PrevChar(const std::string& text, int byteIndex)
+inline int Utf8PrevChar(std::string_view text, int byteIndex)
 {
     if (byteIndex <= 0)
         return 0;
@@ -263,7 +337,22 @@ inline int Utf8PrevChar(const std::string& text, int byteIndex)
     return byteIndex;
 }
 
-inline bool IsNonAsciiWordStart(const std::string& text, int byteIndex)
+inline int Utf8CharEndAtOrAfter(std::string_view text, int byteIndex)
+{
+    const int textLen = static_cast<int>(text.size());
+    byteIndex = std::clamp(byteIndex, 0, textLen);
+    while (byteIndex < textLen && IsUtf8ContinuationByte(static_cast<unsigned char>(text[static_cast<size_t>(byteIndex)])))
+        ++byteIndex;
+    return byteIndex;
+}
+
+inline std::pair<int, int> NormalizeUtf8SelectionRange(std::string_view text, int start, int end)
+{
+    const std::pair<int, int> range = NormalizeSelectionRange(start, end, static_cast<int>(text.size()));
+    return {Utf8CharStartAtOrBefore(text, range.first), Utf8CharEndAtOrAfter(text, range.second)};
+}
+
+inline bool IsNonAsciiWordStart(std::string_view text, int byteIndex)
 {
     if (byteIndex < 0 || byteIndex >= static_cast<int>(text.size()))
         return false;
@@ -330,7 +419,8 @@ inline std::pair<int, int> ExpandEditorWordAt(const std::string& text, int byteI
 
 inline int ByteIndexFromMousePos(const ImVec2& mousePos, const ImVec2& frameMin, float padX, float padY,
                                  float lineSpacing, const std::vector<std::string_view>& lines,
-                                 const std::vector<size_t>& lineStarts)
+                                 const std::vector<size_t>& lineStarts, ImFont* font = nullptr,
+                                 float fontSize = 0.f)
 {
     const int lineCount = static_cast<int>(lines.size());
     if (lineCount == 0)
@@ -347,14 +437,25 @@ inline int ByteIndexFromMousePos(const ImVec2& mousePos, const ImVec2& frameMin,
 
     size_t bestCol = 0;
     float bestDist = relX < 0.f ? -relX : relX;
-    for (size_t col = 1; col <= line.size(); ++col) {
-        const float w = ImGui::CalcTextSize(line.data(), line.data() + col).x;
+    for (size_t col = 0; col < line.size();) {
+        const size_t nextCol = static_cast<size_t>(Utf8NextChar(line, static_cast<int>(col)));
+        if (nextCol <= col)
+            break;
+        const float w = MeasureCodeTextWidth(font, fontSize, line.data(), line.data() + col);
         const float delta = w - relX;
         const float dist = delta < 0.f ? -delta : delta;
         if (dist < bestDist) {
             bestDist = dist;
             bestCol = col;
         }
+        col = nextCol;
+    }
+    {
+        const float w = MeasureCodeTextWidth(font, fontSize, line);
+        const float delta = w - relX;
+        const float dist = delta < 0.f ? -delta : delta;
+        if (dist < bestDist)
+            bestCol = line.size();
     }
     return static_cast<int>(lineStarts[static_cast<size_t>(lineIdx)] + bestCol);
 }
@@ -418,8 +519,9 @@ inline int InputTextSelectionCallback(ImGuiInputTextCallbackData* data)
         return 0;
 
     const int pendingEnd = state->storage->GetInt(state->endId, -1);
-    const int textLen = static_cast<int>(data->BufTextLen);
-    const std::pair<int, int> range = NormalizeSelectionRange(pendingStart, pendingEnd, textLen);
+    const std::pair<int, int> range =
+        NormalizeUtf8SelectionRange(std::string_view(data->Buf, static_cast<size_t>(data->BufTextLen)),
+                                    pendingStart, pendingEnd);
     data->SelectionStart = range.first;
     data->SelectionEnd = range.second;
     state->storage->SetInt(state->startId, -1);
@@ -431,7 +533,8 @@ inline int InputTextSelectionCallback(ImGuiInputTextCallbackData* data)
 
 inline void QueueDoubleClickSelection(const std::string& text, const ImVec2& mousePos, const ImVec2& frameMin,
                                       float padX, float padY, float lineSpacing, const ImVec2& clipMax, bool jsonAware,
-                                      ImGuiStorage* storage, ImGuiID startId, ImGuiID endId)
+                                      ImGuiStorage* storage, ImGuiID startId, ImGuiID endId, ImFont* font = nullptr,
+                                      float fontSize = 0.f)
 {
     if (!ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) || !ImGui::IsWindowHovered())
         return;
@@ -443,14 +546,15 @@ inline void QueueDoubleClickSelection(const std::string& text, const ImVec2& mou
     SplitLines(text, lines, lineStarts);
 
     const int byteIndex =
-        ByteIndexFromMousePos(mousePos, frameMin, padX, padY, lineSpacing, lines, lineStarts);
+        ByteIndexFromMousePos(mousePos, frameMin, padX, padY, lineSpacing, lines, lineStarts, font, fontSize);
     const std::pair<int, int> range = FindDoubleClickSelectionRange(text, byteIndex, jsonAware);
     storage->SetInt(startId, range.first);
     storage->SetInt(endId, range.second);
 }
 
 inline void DrawCodeEditorCaret(ImDrawList* dl, const std::string& text, int cursorPos, const ImVec2& frameMin,
-                                float padX, float padY, float fontSize, const ImVec2& clipMin, const ImVec2& clipMax)
+                                float padX, float padY, float fontSize, const ImVec2& clipMin, const ImVec2& clipMax,
+                                ImFont* font = nullptr)
 {
     const int textLen = static_cast<int>(text.size());
     cursorPos = std::clamp(cursorPos, 0, textLen);
@@ -467,7 +571,7 @@ inline void DrawCodeEditorCaret(ImDrawList* dl, const std::string& text, int cur
     while (lineStart > textBegin && lineStart[-1] != '\n')
         --lineStart;
 
-    const float cursorX = ImGui::CalcTextSize(lineStart, cursorPtr).x;
+    const float cursorX = MeasureCodeTextWidth(font, fontSize, lineStart, cursorPtr);
     const float x = frameMin.x + padX + cursorX;
     const float yBottom = frameMin.y + padY + static_cast<float>(lineNo + 1) * fontSize;
     const float caretTop = yBottom - fontSize + 0.5f;
@@ -486,6 +590,19 @@ inline void DrawCodeEditorCaret(ImDrawList* dl, const std::string& text, int cur
         ImGui::ColorConvertFloat4ToU32(ImGui::GetStyle().Colors[ImGuiCol_Text]);
     dl->AddLine(ImVec2(x, caretTop), ImVec2(x, caretBottom), caretColor, 2.f);
     dl->PopClipRect();
+}
+
+inline float CursorContentX(const std::string& text, int cursorPos, float codeX0, ImFont* font = nullptr,
+                            float fontSize = 0.f)
+{
+    const int textLen = static_cast<int>(text.size());
+    cursorPos = std::clamp(cursorPos, 0, textLen);
+    const char* textBegin = text.c_str();
+    const char* cursorPtr = textBegin + cursorPos;
+    const char* lineStart = cursorPtr;
+    while (lineStart > textBegin && lineStart[-1] != '\n')
+        --lineStart;
+    return codeX0 + MeasureCodeTextWidth(font, fontSize, lineStart, cursorPtr);
 }
 
 inline void DrawColoredTextSegment(ImDrawList* dl, ImFont* font, float fontSize, float x, float y,
@@ -514,9 +631,9 @@ inline void DrawCodeView(const char* id, const std::string& text, const ImVec2& 
     for (int n = lineCount; n >= 10; n /= 10)
         ++maxDigits;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, kCodeBg);
-    ImGui::BeginChild(id, size, false, ImGuiWindowFlags_HorizontalScrollbar);
-
+    const ImVec2 availBeforeChild = ImGui::GetContentRegionAvail();
+    const ImVec2 childSize(ResolveViewExtent(size.x, availBeforeChild.x),
+                           ResolveViewExtent(size.y, availBeforeChild.y));
     if (font)
         ImGui::PushFont(font);
 
@@ -524,18 +641,15 @@ inline void DrawCodeView(const char* id, const std::string& text, const ImVec2& 
     const float lineSpacing = fontSize;
     const float padX = 10.f;
     const float padY = 6.f;
-    char sampleLineNum[16];
-    snprintf(sampleLineNum, sizeof(sampleLineNum), "%*d", maxDigits, lineCount);
-    const float lineNumColW = ImGui::CalcTextSize(sampleLineNum).x + padX * 2.f + 4.f;
+    const float lineNumColW = ComputeLineNumberColumnWidth(maxDigits, lineCount, padX);
     const float codeX0 = lineNumColW + padX;
+    const float maxCodeW = ComputeMaxLineWidth(lines, font, fontSize);
+    const ImVec2 contentSize(ComputeCodeContentWidth(codeX0, maxCodeW, padX, childSize.x, childSize.x),
+                             padY * 2.f + lineCount * lineSpacing);
 
-    float maxCodeW = 0.f;
-    for (const std::string_view line : lines) {
-        const float w = ImGui::CalcTextSize(line.data(), line.data() + line.size()).x;
-        maxCodeW = std::max(maxCodeW, w);
-    }
-
-    const ImVec2 contentSize(codeX0 + maxCodeW + padX, padY * 2.f + lineCount * lineSpacing);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, kCodeBg);
+    ImGui::SetNextWindowContentSize(contentSize);
+    ImGui::BeginChild(id, size, false, ImGuiWindowFlags_HorizontalScrollbar);
     const ImVec2 canvasPos = ImGui::GetCursorScreenPos();
     ImGui::Dummy(contentSize);
     const ImVec2 origin = canvasPos;
@@ -575,7 +689,7 @@ inline void DrawCodeView(const char* id, const std::string& text, const ImVec2& 
             }
             const std::string_view segment(line.data() + col, runEnd - col);
             DrawColoredTextSegment(dl, font, fontSize, x, y, segment, colColor);
-            x += ImGui::CalcTextSize(segment.data(), segment.data() + segment.size()).x;
+            x += MeasureCodeTextWidth(font, fontSize, segment);
             col = runEnd;
         }
     }
@@ -649,7 +763,7 @@ inline void DrawHighlightedLines(ImDrawList* dl, ImFont* font, float fontSize, f
             }
             const std::string_view segment(line.data() + col, runEnd - col);
             DrawColoredTextSegment(dl, font, fontSize, x, y, segment, colColor);
-            x += ImGui::CalcTextSize(segment.data(), segment.data() + segment.size()).x;
+            x += MeasureCodeTextWidth(font, fontSize, segment);
             col = runEnd;
         }
     }
@@ -670,9 +784,9 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
     for (int n = lineCount; n >= 10; n /= 10)
         ++maxDigits;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, kCodeBg);
-    ImGui::BeginChild("wrap", viewSize, false, ImGuiWindowFlags_HorizontalScrollbar);
-
+    const ImVec2 availBeforeChild = ImGui::GetContentRegionAvail();
+    const ImVec2 childSize(ResolveViewExtent(viewSize.x, availBeforeChild.x),
+                           ResolveViewExtent(viewSize.y, availBeforeChild.y));
     if (font)
         ImGui::PushFont(font);
 
@@ -680,19 +794,18 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
     const float lineSpacing = fontSize;
     const float padX = 10.f;
     const float padY = 6.f;
-    char sampleLineNum[16];
-    snprintf(sampleLineNum, sizeof(sampleLineNum), "%*d", maxDigits, lineCount);
-    const float lineNumColW = ImGui::CalcTextSize(sampleLineNum).x + padX * 2.f + 4.f;
+    const float lineNumColW = ComputeLineNumberColumnWidth(maxDigits, lineCount, padX);
     const float codeX0 = lineNumColW + padX;
+    const float maxCodeW = ComputeMaxLineWidth(lines, font, fontSize);
+    const ImVec2 contentSize(ComputeCodeContentWidth(codeX0, maxCodeW, padX, childSize.x, childSize.x),
+                             padY * 2.f + lineCount * lineSpacing);
 
-    float maxCodeW = 0.f;
-    for (const std::string_view line : lines) {
-        const float w = ImGui::CalcTextSize(line.data(), line.data() + line.size()).x;
-        maxCodeW = std::max(maxCodeW, w);
-    }
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, kCodeBg);
+    ImGui::SetNextWindowContentSize(contentSize);
+    ImGui::BeginChild("wrap", viewSize, false, ImGuiWindowFlags_HorizontalScrollbar);
 
-    const ImVec2 contentSize(codeX0 + maxCodeW + padX, padY * 2.f + lineCount * lineSpacing);
-
+    ImGui::SetCursorPos(ImVec2(0.f, 0.f));
+    ImGui::Dummy(contentSize);
     ImGui::SetCursorPos(ImVec2(0.f, 0.f));
     const ImVec2 origin = ImGui::GetCursorScreenPos();
 
@@ -710,18 +823,31 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
     const ImGuiID selStartId = ImGui::GetID("##dblsel_start");
     const ImGuiID selEndId = ImGui::GetID("##dblsel_end");
     EditSelectionCallbackState selCallbackState{storage, selStartId, selEndId};
-    ImGuiInputTextFlags inputFlags = ImGuiInputTextFlags_CallbackAlways;
+    ImGuiInputTextFlags inputFlags =
+        ImGuiInputTextFlags_CallbackAlways | ImGuiInputTextFlags_NoHorizontalScroll;
     if (readOnly)
         inputFlags |= ImGuiInputTextFlags_ReadOnly;
     const ImVec2& mousePos = ImGui::GetIO().MousePos;
+    bool editorActive = false;
+    ImVec2 editorFrameMin;
 
     auto drawEditorInput = [&]() {
         QueueDoubleClickSelection(text, mousePos, codeFrameMin, padX, padY, lineSpacing, clipMax, jsonHighlight,
-                                  storage, selStartId, selEndId);
+                                  storage, selStartId, selEndId, font, fontSize);
         ImGui::InputTextMultiline("##edit", &text, inputSize, inputFlags, InputTextSelectionCallback,
                                   &selCallbackState);
+        editorActive = ImGui::IsItemActive() || ImGui::IsItemFocused();
+        editorFrameMin = ImGui::GetItemRectMin();
         QueueDoubleClickSelection(text, mousePos, ImGui::GetItemRectMin(), padX, padY, lineSpacing, clipMax,
-                                  jsonHighlight, storage, selStartId, selEndId);
+                                  jsonHighlight, storage, selStartId, selEndId, font, fontSize);
+        if (editorActive) {
+            const float cursorContentX = CursorContentX(text, selCallbackState.cursorPos, codeX0, font, fontSize);
+            const float targetScrollX =
+                ComputeScrollForContentX(ImGui::GetScrollX(), childSize.x, cursorContentX, padX,
+                                         kTrailingSelectionPadding * 0.25f, ImGui::GetScrollMaxX());
+            if (targetScrollX != ImGui::GetScrollX())
+                ImGui::SetScrollX(targetScrollX);
+        }
     };
 
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(padX, padY));
@@ -742,41 +868,27 @@ inline void DrawEditableCodeView(const char* id, std::string& text, const ImVec2
 
         ImGui::PopStyleColor(2);
 
-        if (ImGui::IsItemActive() || ImGui::IsItemFocused()) {
+        if (editorActive) {
             DrawCodeEditorCaret(ImGui::GetForegroundDrawList(), text, selCallbackState.cursorPos,
-                                ImGui::GetItemRectMin(), padX, padY, fontSize, clipMin, clipMax);
+                                editorFrameMin, padX, padY, fontSize, clipMin, clipMax, font);
         }
     } else {
+        spans.clear();
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.f, 0.f, 0.f, 0.f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.f, 0.f, 0.f, 0.f));
+
         dl->PushClipRect(clipMin, clipMax, true);
-        dl->AddRectFilled(ImVec2(origin.x, origin.y), ImVec2(origin.x + lineNumColW, origin.y + contentSize.y),
-                          kLineNumBg);
-        dl->AddLine(ImVec2(origin.x + lineNumColW, origin.y),
-                    ImVec2(origin.x + lineNumColW, origin.y + contentSize.y), kLineNumSep);
-        for (int li = visibleLines.first; li < visibleLines.second; ++li) {
-            const float y = origin.y + padY + static_cast<float>(li) * lineSpacing;
-            if (y + lineSpacing < clipMin.y || y > clipMax.y)
-                continue;
-            char numBuf[16];
-            const int numLen = snprintf(numBuf, sizeof(numBuf), "%*d", maxDigits, li + 1);
-            const float numW = ImGui::CalcTextSize(numBuf, numBuf + numLen).x;
-            const float numX = origin.x + (lineNumColW - numW) * 0.5f;
-            DrawColoredTextSegment(dl, font, fontSize, numX, y, numBuf, kLineNumColor);
-        }
+        DrawHighlightedLines(dl, font, fontSize, lineSpacing, origin, lineNumColW, codeX0, padY, contentSize.y,
+                             maxDigits, lineCount, lines, lineStarts, spans, false,
+                             visibleLines.first, visibleLines.second);
         dl->PopClipRect();
 
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImGui::ColorConvertU32ToFloat4(kCodeBg));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(kDefaultColor));
         drawEditorInput();
         ImGui::PopStyleColor(2);
-        if (readOnly && (ImGui::IsItemActive() || ImGui::IsItemFocused())) {
+        if (editorActive) {
             DrawCodeEditorCaret(ImGui::GetForegroundDrawList(), text, selCallbackState.cursorPos,
-                                ImGui::GetItemRectMin(), padX, padY, fontSize, clipMin, clipMax);
+                                editorFrameMin, padX, padY, fontSize, clipMin, clipMax, font);
         }
-    }
-
-    if (contentSize.x > 1.f && contentSize.y > 1.f) {
-        ImGui::SetCursorPos(ImVec2(contentSize.x - 1.f, contentSize.y - 1.f));
-        ImGui::Dummy(ImVec2(1.f, 1.f));
     }
 
     ImGui::PopStyleVar(2);

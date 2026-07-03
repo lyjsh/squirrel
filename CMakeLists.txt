@@ -109,6 +109,7 @@ endif()
 
 add_executable(squirrel
     src/main.cpp
+    src/AppFonts.cpp
     src/HttpWin.cpp
     src/CookieJar.cpp
 )
@@ -154,6 +155,14 @@ if(MINGW)
     target_link_libraries(squirrel PRIVATE -static)
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+    add_custom_command(TARGET squirrel POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+                "$<TARGET_FILE_DIR:squirrel>/assets"
+    )
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(squirrel_json_view_tests EXCLUDE_FROM_ALL
@@ -165,4 +174,12 @@ if(BUILD_TESTING)
         ${imgui_SOURCE_DIR}/misc/cpp
     )
     add_test(NAME squirrel_json_view_tests COMMAND squirrel_json_view_tests)
+
+    add_executable(squirrel_history_search_tests EXCLUDE_FROM_ALL
+        tests/history_search_tests.cpp
+    )
+    target_include_directories(squirrel_history_search_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    add_test(NAME squirrel_history_search_tests COMMAND squirrel_history_search_tests)
 endif()

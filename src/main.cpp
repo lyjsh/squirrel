@@ -1,6 +1,8 @@
 #include "HttpWin.h"
 #include "CookieJar.h"
 #include "JsonHighlight.h"
+#include "AppFonts.h"
+#include "HistorySearch.h"
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -17,7 +19,6 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
-#include <regex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -64,51 +65,10 @@ std::string ToLowerCopy(std::string s)
 // 模糊过滤：空格分隔的多个关键词均需在不区分大小写的「方法 + 完整 URL」中命中（子串）
 bool HistoryMatchesFilter(const char* filter, const std::string& method, const std::string& fullUrl)
 {
-    if (!filter || !filter[0])
-        return true;
-
     std::string hayRaw = method;
     hayRaw.push_back(' ');
     hayRaw += fullUrl;
-
-    std::string f(filter);
-    while (!f.empty() && std::isspace(static_cast<unsigned char>(f.front())))
-        f.erase(0, 1);
-    while (!f.empty() && std::isspace(static_cast<unsigned char>(f.back())))
-        f.pop_back();
-    if (f.empty())
-        return true;
-
-    // re: 前缀启用正则匹配（忽略大小写），例如：re:^GET\\s+https?://api\\.
-    if (f.rfind("re:", 0) == 0) {
-        const std::string pattern = f.substr(3);
-        if (pattern.empty())
-            return true;
-        try {
-            const std::regex re(pattern, std::regex::ECMAScript | std::regex::icase);
-            return std::regex_search(hayRaw, re);
-        } catch (const std::regex_error&) {
-            return false;
-        }
-    }
-
-    std::string hay = ToLowerCopy(hayRaw);
-    f = ToLowerCopy(std::move(f));
-    size_t pos = 0;
-    while (pos < f.size()) {
-        while (pos < f.size() && f[pos] == ' ')
-            ++pos;
-        if (pos >= f.size())
-            break;
-        size_t sp = f.find(' ', pos);
-        if (sp == std::string::npos)
-            sp = f.size();
-        const std::string tok = f.substr(pos, sp - pos);
-        if (!tok.empty() && hay.find(tok) == std::string::npos)
-            return false;
-        pos = sp + 1;
-    }
-    return true;
+    return HistorySearch::HistoryMatchesFilter(filter, hayRaw);
 }
 
 std::string UrlEncode(const std::string& s)
@@ -1398,6 +1358,20 @@ std::string MultipartFingerprint(const std::vector<MultipartRow>& rows)
     return o;
 }
 
+std::string BuildHistorySearchText(const RequestHistoryEntry& e, const std::string& fullUrl)
+{
+    HistorySearch::RequestSearchDocument doc;
+    doc.method = e.method;
+    doc.fullUrl = fullUrl;
+    doc.queryRows = e.queryRows;
+    doc.headerRows = e.headerRows;
+    doc.bodyMode = e.bodyMode;
+    doc.rawBody = e.reqBody;
+    doc.formRows = e.formRows;
+    doc.multipartRows = e.multipartRows;
+    return HistorySearch::BuildRequestSearchText(doc);
+}
+
 void AppendPayloadField(std::string& payload, const char* key, const std::string& value)
 {
     if (!payload.empty())
@@ -1583,75 +1557,10 @@ int main()
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr;
 
-    // Segoe UI（Google 风格无衬线）+ 微软雅黑合并，保证中英文显示
-    ImFont* fontEditorUtf8 = nullptr;
-    ImFont* fontTitle = nullptr;
-    ImFont* fontCode = nullptr;
-    {
-        ImFontConfig cfg;
-        cfg.OversampleH = 2;
-        cfg.OversampleV = 2;
-        const ImWchar* ranges = io.Fonts->GetGlyphRangesChineseFull();
-        ImFont* ui = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 17.0f, &cfg,
-                                                  io.Fonts->GetGlyphRangesDefault());
-        if (!ui)
-            ui = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 19.0f, &cfg, ranges);
-        if (ui) {
-            ImFontConfig cfgMerge;
-            cfgMerge.MergeMode = true;
-            cfgMerge.OversampleH = 2;
-            cfgMerge.OversampleV = 2;
-            io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", 19.0f, &cfgMerge, ranges);
-            io.FontDefault = ui;
-        }
-        fontEditorUtf8 = io.FontDefault ? io.FontDefault : io.Fonts->Fonts[0];
-
-        ImFontConfig cfgTitle;
-        cfgTitle.OversampleH = 2;
-        cfgTitle.OversampleV = 2;
-        fontTitle = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 26.0f, &cfgTitle,
-                                                 io.Fonts->GetGlyphRangesDefault());
-        if (!fontTitle)
-            fontTitle = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 26.0f, &cfgTitle,
-                                                     io.Fonts->GetGlyphRangesDefault());
-        if (fontTitle) {
-            ImFontConfig cfgTitleMerge;
-            cfgTitleMerge.MergeMode = true;
-            io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyhbd.ttc", 26.0f, &cfgTitleMerge, ranges);
-        }
-
-        ImFontConfig cfgCode;
-        cfgCode.OversampleH = 2;
-        cfgCode.OversampleV = 2;
-        constexpr float kCodeLatinPx = 15.0f;
-        constexpr float kCodeCjkPx = 17.0f;
-        fontCode = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", kCodeCjkPx, &cfgCode, ranges);
-        if (!fontCode)
-            fontCode = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\simhei.ttf", kCodeCjkPx, &cfgCode, ranges);
-        if (fontCode) {
-            ImFontConfig cfgCodeMerge;
-            cfgCodeMerge.MergeMode = true;
-            cfgCodeMerge.OversampleH = 2;
-            cfgCodeMerge.OversampleV = 2;
-            io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", kCodeLatinPx, &cfgCodeMerge,
-                                         io.Fonts->GetGlyphRangesDefault());
-        } else {
-            fontCode = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", kCodeLatinPx, &cfgCode,
-                                                    io.Fonts->GetGlyphRangesDefault());
-            if (!fontCode)
-                fontCode = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\cour.ttf", kCodeLatinPx, &cfgCode,
-                                                        io.Fonts->GetGlyphRangesDefault());
-            if (fontCode) {
-                ImFontConfig cfgCodeMerge;
-                cfgCodeMerge.MergeMode = true;
-                cfgCodeMerge.OversampleH = 2;
-                cfgCodeMerge.OversampleV = 2;
-                io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc", kCodeCjkPx, &cfgCodeMerge, ranges);
-            }
-        }
-        if (!fontCode)
-            fontCode = fontEditorUtf8;
-    }
+    // Load project-packaged fonts first, with system fonts as fallback.
+    const AppFontSet appFonts = LoadAppFonts(io);
+    ImFont* fontTitle = appFonts.title;
+    ImFont* fontCode = appFonts.code ? appFonts.code : appFonts.ui;
 
     ImGui::StyleColorsLight();
     ApplyMaterialTheme();
@@ -1809,24 +1718,32 @@ int main()
         ImGui::Spacing();
 
         const float sidebarW = 280.f;
+        const float mainHeaderH = 52.f;
+        const float mainTabHeaderH = ImGui::GetFrameHeightWithSpacing();
+        const float sidebarHeaderH = mainTabHeaderH + mainHeaderH;
         const float mainH = ImGui::GetContentRegionAvail().y;
         ImGui::BeginChild("main_row", ImVec2(0, mainH), false);
 
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 12.f);
         ImGui::PushStyleColor(ImGuiCol_ChildBg, Material::kSurface);
         ImGui::BeginChild("sidebar", ImVec2(sidebarW, 0), true);
-        ImGui::PushStyleColor(ImGuiCol_Text, Material::kOnSurface);
-        ImGui::TextUnformatted("请求历史");
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
         static char historyFilterBuf[256] = "";
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##histfilter", "搜索历史…（正则: re:pattern）", historyFilterBuf,
-                                 sizeof(historyFilterBuf));
-        ImGui::Spacing();
+        ImGui::BeginChild("history_header", ImVec2(0, sidebarHeaderH), false, ImGuiWindowFlags_NoScrollbar);
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, Material::kOnSurface);
+            ImGui::TextUnformatted("请求历史");
+            ImGui::PopStyleColor();
+            const float filterY = mainTabHeaderH + std::max(0.f, (mainHeaderH - ImGui::GetFrameHeight()) * 0.5f);
+            ImGui::SetCursorPosY(filterY);
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##histfilter", "搜索历史…（空格分词匹配）", historyFilterBuf,
+                                     sizeof(historyFilterBuf));
+        }
+        ImGui::EndChild();
         ImGui::Separator();
         ImGui::BeginChild("hist_list", ImVec2(0, 0), false);
         bool anyShown = false;
+        const bool historyFilterActive = HistorySearch::HasFilterText(historyFilterBuf);
 
         {
             const float draftRowH = ImGui::GetTextLineHeightWithSpacing() + 4.f;
@@ -1860,8 +1777,11 @@ int main()
         for (int i = 0; i < static_cast<int>(requestHistory.size()); ++i) {
             const RequestHistoryEntry& e = requestHistory[static_cast<size_t>(i)];
             const std::string full = MergeUrlQuery(e.url, e.queryRows);
-            if (!HistoryMatchesFilter(historyFilterBuf, e.method, full))
-                continue;
+            if (historyFilterActive) {
+                const std::string searchText = BuildHistorySearchText(e, full);
+                if (!HistorySearch::HistoryMatchesFilter(historyFilterBuf, searchText))
+                    continue;
+            }
             anyShown = true;
 
             ImGui::PushID(i);
@@ -1950,7 +1870,8 @@ int main()
         if (ImGui::BeginTabBar("reqwin_tabs", ImGuiTabBarFlags_DrawSelectedOverline)) {
             if (ImGui::BeginTabItem("HTTP 请求")) {
 
-        ImGui::BeginChild("url_row", ImVec2(0, 52), false);
+        ImGui::BeginChild("url_row", ImVec2(0, mainHeaderH), false, ImGuiWindowFlags_NoScrollbar);
+        ImGui::SetCursorPosY(std::max(0.f, (mainHeaderH - ImGui::GetFrameHeight()) * 0.5f));
         ImGui::AlignTextToFramePadding();
         ImGui::SetNextItemWidth(112);
         const char* methods[] = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"};
